@@ -150,17 +150,25 @@ The inventory Word document will list the team name and **Peng Wang, Jinyuan He 
 
 ## 5. Dataset and paired inputs
 
-Source: [PlantSR dataset on Figshare](https://figshare.com/articles/dataset/PlantSR_Dataset/24648150), 1,030 plant images: 830 official training images and 200 official test images. Dataset license: CC BY 4.0.
+The [PlantSR dataset on Figshare](https://figshare.com/articles/dataset/PlantSR_Dataset/24648150) contains 1,030 plant images: 830 official training images and 200 official test images. The dataset is licensed under CC BY 4.0.
 
-Data split: **664 train / 166 validation / 200 test**. Preserve the official test set, subject to documented duplicate checks; report actual retained counts if the audit requires exclusions.
+We divided the official training images into training and validation sets by original image. The official test set was retained subject to the documented audit and duplicate checks. The final split counts are recorded in `prepared/summary.json`, and any exclusions are listed in `prepared/manifests/excluded.csv`.
 
-- Split by original image before cropping, augmentation or degradation.
-- Keep all derivatives from an original in the same split.
-- Use random 256×256 crops for training.
-- For the initial benchmark, use one fixed 256×256 crop per validation/test source image and store its coordinates.
-- Keep validation/test noise and masks fixed and reproducible.
-- Do not upscale a small source image and describe it as true high-resolution ground truth.
-- Report the benchmark as crop-based; full-image performance requires additional evaluation.
+### Download and use the prepared dataset
+
+1. Download [PlantSR_prepared_for_team.zip]([PASTE_GOOGLE_DRIVE_LINK_HERE](https://drive.google.com/file/d/1j_vx9Yuow1pu8MzYmbGY4udXBpB4dBx1/view?usp=sharing)) from Google Drive.
+2. Extract the ZIP and set your dataset root to the extracted `prepared/` folder. Resolve image and crop paths in the CSV manifests relative to that folder.
+3. Use the same `train.csv`, `val.csv`, and `test.csv` manifests under `prepared/manifests/` for all four restoration tasks.
+
+The [preprocessing notebook](notebooks/PlantSR_Preprocessing_Center256.ipynb) documents the audit, split assignment, and crop export.
+
+### Training and evaluation inputs
+
+- Assign splits before cropping, augmentation, or degradation. Keep each original image and all its derivatives in the same split.
+- During training, sample random 256 × 256 crops from the full-size training images, then apply the degradation for each task.
+- For validation and testing, use the saved 256 × 256 center crop for each image. The manifests record the crop coordinates.
+- Use fixed, reproducible validation and test degradations, including noise and masks where applicable. Use identical inputs and targets when comparing pretrained and fine-tuned models.
+- Use native-resolution crops as reference targets. Report results as a crop-based benchmark. Full-image performance requires a separate evaluation.
 
 | Task | Model input | Reference target | Initial recipe |
 | --- | --- | --- | --- |
