@@ -156,7 +156,7 @@ We divided the official training images into training and validation sets by ori
 
 ### Download and use the prepared dataset
 
-1. Download [PlantSR_prepared_for_team.zip]([PASTE_GOOGLE_DRIVE_LINK_HERE](https://drive.google.com/file/d/1j_vx9Yuow1pu8MzYmbGY4udXBpB4dBx1/view?usp=sharing)) from Google Drive.
+1. Download [PlantSR_prepared_for_team.zip](https://drive.google.com/file/d/1j_vx9Yuow1pu8MzYmbGY4udXBpB4dBx1/view?usp=sharing) from Google Drive.
 2. Extract the ZIP and set your dataset root to the extracted `prepared/` folder. Resolve image and crop paths in the CSV manifests relative to that folder.
 3. Use the same `train.csv`, `val.csv`, and `test.csv` manifests under `prepared/manifests/` for all four restoration tasks.
 
