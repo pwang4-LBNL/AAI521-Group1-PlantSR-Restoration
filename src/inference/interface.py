@@ -18,6 +18,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 
+from src.data.inpaint_masks import binarize_mask
+
 TASKS = ("denoising", "super_resolution", "colorization", "inpainting")
 TASK_LABELS = {
     "denoising": "Denoising",
@@ -111,28 +113,25 @@ def normalize_image(image) -> Image.Image:
 
 
 def normalize_mask(mask, size: tuple[int, int]) -> np.ndarray:
-    """Return a uint8 {0,1} mask of shape (height, width); 1 = missing/reconstruct."""
+    """Return a uint8 {0,1} mask of shape (height, width); 1 = missing/reconstruct.
+
+    Accepts a path, PIL image or array encoded as 0/1 or 0/255 (see `binarize_mask`). A mask of
+    a different size is resized to `size` with nearest-neighbour sampling.
+    """
     if isinstance(mask, (str, Path)):
         with Image.open(mask) as src:
-            mask = src.convert("L")
-            mask.load()
+            src.load()
+            mask = src.copy()
     if isinstance(mask, Image.Image):
-        if mask.mode in ("RGBA", "LA"):
-            alpha = np.asarray(mask.getchannel("A"))
-            gray = np.asarray(mask.convert("L"))
-            mask = Image.fromarray(np.where(alpha > 0, gray, 0).astype(np.uint8))
-        if mask.size != size:
-            mask = mask.convert("L").resize(size, Image.NEAREST)
-        arr = np.asarray(mask.convert("L")) > 127
-    else:
-        arr = np.asarray(mask)
-        if arr.ndim == 3:
-            arr = arr[..., 0]
-        threshold = 127 if arr.dtype == np.uint8 and arr.max() > 1 else 0.5
-        arr = arr > threshold
-        if arr.shape != (size[1], size[0]):
-            arr = np.asarray(Image.fromarray(arr.astype(np.uint8) * 255).resize(size, Image.NEAREST)) > 127
-    return arr.astype(np.uint8)
+        if mask.mode in ("RGBA", "LA", "PA") or (mask.mode == "P" and "transparency" in mask.info):
+            mask = mask.convert("RGBA")
+        elif mask.mode not in ("L", "RGB"):
+            mask = mask.convert("L")  # 1-bit, palette and 16-bit masks
+        mask = np.asarray(mask)
+    binary = binarize_mask(mask)
+    if binary.shape != (size[1], size[0]):
+        binary = np.asarray(Image.fromarray(binary.astype(np.uint8) * 255).resize(size, Image.NEAREST)) > 127
+    return binary.astype(np.uint8)
 
 
 class Registry:

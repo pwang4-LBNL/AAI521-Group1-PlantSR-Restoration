@@ -196,9 +196,29 @@ def save_mask_png(mask: np.ndarray, path) -> None:
     Image.fromarray((np.asarray(mask) > 0).astype(np.uint8) * 255).save(path)
 
 
+def binarize_mask(values) -> np.ndarray:
+    """Boolean mask (True = missing) from either encoding used in the project.
+
+    Both 0/1 and 0/255 masks are accepted: when the largest value is at most 1 the mask is
+    read as 0/1 (above 0.5 = missing), otherwise as 8-bit (above 127 = missing). Colour masks
+    use their brightest channel; a trailing alpha channel marks transparent pixels as preserved.
+    """
+    arr = np.asarray(values)
+    if arr.ndim == 3:
+        if arr.shape[2] in (2, 4):  # LA / RGBA: colour where opaque, 0 where transparent
+            arr = np.where(arr[..., -1] > 0, arr[..., :-1].max(axis=2), 0)
+        else:
+            arr = arr.max(axis=2)
+    if arr.dtype == bool or arr.size == 0:
+        return arr.astype(bool)
+    threshold = 0.5 if float(arr.max()) <= 1.0 else 127.0
+    return arr > threshold
+
+
 def load_mask_png(path) -> np.ndarray:
+    """Read a mask PNG saved as 0/255 or 0/1 and return uint8 {0,1}."""
     with Image.open(path) as image:
-        return (np.asarray(image.convert("L")) > 127).astype(np.uint8)
+        return binarize_mask(np.asarray(image.convert("L"))).astype(np.uint8)
 
 
 def apply_mask(image: np.ndarray, mask: np.ndarray, fill: int = FILL_VALUE) -> np.ndarray:

@@ -6,7 +6,8 @@ Flask application and user interface for the four restoration tasks.
 
 - Upload a JPG/PNG (drag and drop) or choose a **benchmark example** (validation crop with a fixed degradation).
 - Choose a task and method. Baselines are always available; diffusion inpainting runs on the GPU.
-- Inpainting mask: paint with a brush or eraser, upload a mask PNG (white = fill), live coverage percentage.
+- Inpainting mask: paint with a brush or eraser, upload a mask PNG (white = fill; 0/255 or 0/1), live coverage percentage.
+- Controls are locked while a job runs, and each result is labelled with the task it was submitted for.
 - Processing status with queue position; one background worker runs GPU jobs one at a time.
 - Side-by-side input/output, received → processed → output dimensions, model version and timing.
 - PSNR/SSIM shown **only** for benchmark examples, where the reference is known.

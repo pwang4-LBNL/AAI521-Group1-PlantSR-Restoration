@@ -13,7 +13,7 @@ result = restore(image, task, mask=None, seed=42, method="sd15_finetuned")  # op
 | --- | --- |
 | `image` | PIL image, RGB `uint8` array or file path. Converted to RGB; transparency is flattened onto white. |
 | `task` | `"denoising"`, `"super_resolution"`, `"colorization"` or `"inpainting"`. |
-| `mask` | Inpainting only. Same size as `image`; **1/white = missing (reconstruct), 0/black = preserve**. PIL, array or path. |
+| `mask` | Inpainting only. Same size as `image`; **1/white = missing (reconstruct), 0/black = preserve**. PIL, array or path, encoded as 0/1 or 0/255. |
 | `seed` | Integer used by generative models; deterministic methods ignore it. |
 | `method` | Optional. Defaults to the task's default method (baseline, pretrained or fine-tuned). |
 

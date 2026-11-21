@@ -15,7 +15,6 @@ Fresh-process reload check (run by the notebook):
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import platform
 import time
@@ -122,6 +121,17 @@ class TrainCropDataset:
                 "flip": flip, "mask_type": params["mask_type"], "coverage": params["coverage"]}
 
 
+def epoch_batches(loader):
+    """Yield batches forever, starting a fresh pass over `loader` each epoch.
+
+    Unlike itertools.cycle, which replays the cached first epoch, every new pass reshuffles and
+    draws new random crops, flips and masks from the dataset.
+    """
+    while True:
+        for batch in loader:
+            yield batch
+
+
 def _collate(items):
     import torch
 
@@ -176,7 +186,7 @@ def train_lora_trial(pipe, dataset: TrainCropDataset, cfg: LoraTrialConfig, prog
     generator = torch.Generator().manual_seed(cfg.seed)
     loader = torch.utils.data.DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=0,
                                          collate_fn=_collate, generator=generator, drop_last=True)
-    batches = itertools.cycle(loader)
+    batches = epoch_batches(loader)
     sf = vae.config.scaling_factor
     result = TrialResult(trainable_parameters=sum(p.numel() for p in params), trainable_tensors=len(params),
                          amp_dtype=str(amp_dtype).replace("torch.", ""),

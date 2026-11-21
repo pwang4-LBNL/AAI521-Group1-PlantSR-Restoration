@@ -18,7 +18,7 @@ const METRIC_LABELS = {
 const state = {
   tasks: [], task: null, source: "upload", file: null, exampleId: null, examples: [],
   loaded: false, tool: "brush", drawing: false, last: null, maskLocked: false,
-  coverage: 0, busy: false, jobId: null, pollTimer: null,
+  coverage: 0, busy: false, jobId: null, pollTimer: null, submitted: null,
 };
 
 const imageCanvas = $("imageCanvas");
@@ -77,6 +77,7 @@ function renderTasks() {
 }
 
 function selectTask(name) {
+  if (state.busy) return;
   state.task = name;
   const task = currentTask();
   document.querySelectorAll(".task").forEach((b) => {
@@ -148,7 +149,7 @@ function loadImageFromUrl(url) {
 }
 
 async function loadFile(file) {
-  if (!file) return;
+  if (!file || state.busy) return;
   if (!/^image\/(jpeg|png)$/.test(file.type) && !/\.(jpe?g|png)$/i.test(file.name)) {
     setStatus("Please choose a JPG or PNG image.", "error");
     return;
@@ -171,7 +172,7 @@ async function loadFile(file) {
 }
 
 async function loadExample(id) {
-  if (!id) return;
+  if (!id || state.busy) return;
   state.exampleId = id;
   const task = state.task || "inpainting";
   try {
@@ -194,6 +195,7 @@ async function loadExample(id) {
 }
 
 function setSource(source) {
+  if (state.busy) return;
   state.source = source;
   document.querySelectorAll("[data-source]").forEach((b) => {
     const active = b.dataset.source === source;
@@ -259,7 +261,7 @@ function strokeTo(point) {
 }
 
 maskCanvas.addEventListener("pointerdown", (event) => {
-  if (state.maskLocked || !state.loaded) return;
+  if (state.maskLocked || !state.loaded || state.busy) return;
   state.drawing = true;
   state.last = null;
   maskCanvas.setPointerCapture(event.pointerId);
@@ -288,9 +290,14 @@ function paintMaskFromImage(img) {
   ctx.drawImage(img, 0, 0, w, h);
   const src = ctx.getImageData(0, 0, w, h).data;
   const out = maskCtx.createImageData(w, h);
+  // Same rule as the server: a mask whose brightest value is at most 1 is a 0/1 mask
+  // (above 0.5 = fill); otherwise it is 0/255 (above 127 = fill). Transparent pixels are kept.
+  const value = (i) => (src[i + 3] > 0 ? Math.max(src[i], src[i + 1], src[i + 2]) : 0);
+  let peak = 0;
+  for (let i = 0; i < src.length; i += 4) peak = Math.max(peak, value(i));
+  const threshold = peak <= 1 ? 0.5 : 127;
   for (let i = 0; i < src.length; i += 4) {
-    const lum = 0.299 * src[i] + 0.587 * src[i + 1] + 0.114 * src[i + 2];
-    if (lum > 127 && src[i + 3] > 0) {
+    if (value(i) > threshold) {
       out.data[i] = 255; out.data[i + 1] = 48; out.data[i + 2] = 48; out.data[i + 3] = 255;
     }
   }
@@ -308,7 +315,7 @@ function updateCoverage() {
     for (let i = 3; i < data.length; i += 4) if (data[i] > 0) count += 1;
     state.coverage = count / (maskCanvas.width * maskCanvas.height);
   }
-  $("coverage").textContent = `${(state.coverage * 100).toFixed(1)}%`;
+  $("coverage").textContent = `${(state.coverage * 100).toFixed(2)}%`;
   updateRunButton();
 }
 
@@ -331,6 +338,26 @@ function maskBlob() {
 }
 
 // ---------------------------------------------------------------- jobs
+// Lock everything that defines a job (image, task, method, seed, mask) while it runs,
+// so the finished result always matches what was submitted.
+function setBusy(busy) {
+  state.busy = busy;
+  document.body.classList.toggle("busy", busy);
+  const controls = document.querySelectorAll(
+    ".task, [data-source], #fileInput, #exampleSelect, #methodSelect, #seedInput, [data-tool], #clearMask, #maskFile");
+  controls.forEach((el) => {
+    if (busy) {
+      el.dataset.wasDisabled = el.disabled ? "1" : "";
+      el.disabled = true;
+    } else {
+      el.disabled = el.dataset.wasDisabled === "1";
+      delete el.dataset.wasDisabled;
+    }
+  });
+  $("dropzone").classList.toggle("disabled", busy);
+  updateRunButton();
+}
+
 function updateRunButton() {
   const task = currentTask();
   const needsMask = task && task.needs_mask && state.source === "upload";
@@ -358,8 +385,12 @@ async function runJob() {
     form.append("image", state.file, state.file.name);
     if (currentTask().needs_mask) form.append("mask", await maskBlob(), "mask.png");
   }
-  state.busy = true;
-  updateRunButton();
+  const method = currentMethod();
+  state.submitted = {
+    task: currentTask(), method, seed: $("seedInput").value || "42",
+    input: state.source === "example" ? state.exampleId : state.file.name,
+  };
+  setBusy(true);
   resetOutput();
   setStatus("Uploading…", "", true);
   try {
@@ -367,8 +398,7 @@ async function runJob() {
     state.jobId = job.id;
     poll();
   } catch (err) {
-    state.busy = false;
-    updateRunButton();
+    setBusy(false);
     setStatus(err.message, "error");
   }
 }
@@ -384,14 +414,12 @@ async function poll() {
       setStatus(`Processing… ${seconds}s`, "", true);
     }
     if (job.status === "done" || job.status === "error") {
-      state.busy = false;
-      updateRunButton();
+      setBusy(false);
       return finish(job);
     }
   } catch (err) {
     setStatus(`Lost contact with the server: ${err.message}`, "error");
-    state.busy = false;
-    updateRunButton();
+    setBusy(false);
     return;
   }
   state.pollTimer = setTimeout(poll, 700);
@@ -414,10 +442,13 @@ function finish(job) {
   img.hidden = false;
   $("outputPlaceholder").hidden = true;
   $("outputDims").textContent = dims(r.output_size);
-  const method = currentTask().methods.find((m) => m.method === job.method);
+  // Describe the job that ran (server record), not whatever is selected now.
+  const task = state.tasks.find((t) => t.task === job.task) || { label: job.task, methods: [] };
+  const method = task.methods.find((m) => m.method === job.method);
   const rows = [
-    ["Task", currentTask().label],
+    ["Task", task.label],
     ["Method", method ? method.label : job.method],
+    ["Input", state.submitted ? state.submitted.input : "—"],
     ["Model version", r.model_version],
     ["Received", dims(r.input_size)],
     ["Processed at", dims(r.processed_size)],
@@ -425,7 +456,7 @@ function finish(job) {
     ["Inference time", `${r.elapsed_seconds.toFixed(2)} s`],
   ];
   if (method && method.generative) rows.push(["Seed", String(job.seed)]);
-  if (r.mask_coverage !== undefined) rows.push(["Mask coverage", `${(r.mask_coverage * 100).toFixed(1)}%`]);
+  if (r.mask_coverage !== undefined) rows.push(["Mask coverage", `${(r.mask_coverage * 100).toFixed(2)}%`]);
   const table = $("infoTable");
   table.textContent = "";
   const addRow = (label, value, cls) => {
