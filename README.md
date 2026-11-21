@@ -28,7 +28,7 @@ Sharper or more colorful outputs do not necessarily contain accurate botanical d
 
 | Role | Member | Restoration tasks | Project responsibilities | Reviewer |
 | --- | --- | --- | --- | --- |
-| A | Peng Wang — GitHub: pwang4-LBNL | Super-resolution | Data preparation and splits, shared evaluation, botanical detail analysis, report coordination | Ali |
+| A | Peng Wang | Super-resolution | Data preparation and splits, shared evaluation, botanical detail analysis, report coordination | Ali |
 | B | Jinyuan He | Denoising and colorization | GitHub code organization, updates, code review, automated checks and reproducibility | Peng |
 | C | Ali Abdul-Haneed | Inpainting | Application development, model integration, deployment and user testing | Jinyuan |
 
