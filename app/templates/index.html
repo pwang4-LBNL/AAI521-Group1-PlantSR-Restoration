@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PlantSR Restoration</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <div>
+        <h1>PlantSR Restoration</h1>
+        <p class="subtitle">Denoising · Super-resolution · Colorization · Inpainting</p>
+      </div>
+    </div>
+    <div id="health" class="pill" title="Server status">Connecting…</div>
+  </header>
+
+  <main class="layout">
+    <section class="panel controls" aria-label="Controls">
+      <div class="step">
+        <h2><span class="num">1</span> Image</h2>
+        <div class="segmented" role="tablist">
+          <button type="button" class="seg active" data-source="upload" role="tab" aria-selected="true">Upload</button>
+          <button type="button" class="seg" data-source="example" role="tab" aria-selected="false">Benchmark example</button>
+        </div>
+        <div id="uploadPane">
+          <label id="dropzone" class="dropzone">
+            <input id="fileInput" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png">
+            <strong>Drop a JPG or PNG</strong>
+            <span>or click to browse</span>
+          </label>
+        </div>
+        <div id="examplePane" hidden>
+          <select id="exampleSelect" aria-label="Benchmark example"></select>
+          <p class="hint">Validation crop with a fixed degradation. Scores are computed against the known reference.</p>
+        </div>
+        <p id="imageInfo" class="hint"></p>
+      </div>
+
+      <div class="step">
+        <h2><span class="num">2</span> Task</h2>
+        <div id="taskList" class="task-grid" role="radiogroup" aria-label="Restoration task"></div>
+        <label class="field">Method
+          <select id="methodSelect"></select>
+        </label>
+        <p id="methodDesc" class="hint"></p>
+        <label id="seedRow" class="field inline">Seed
+          <input id="seedInput" type="number" value="42" step="1">
+        </label>
+      </div>
+
+      <div id="maskTools" class="step" hidden>
+        <h2><span class="num">3</span> Mask <span class="hint">white = area to fill</span></h2>
+        <div class="row">
+          <div class="segmented small">
+            <button type="button" class="seg active" data-tool="brush">Brush</button>
+            <button type="button" class="seg" data-tool="eraser">Eraser</button>
+          </div>
+          <label class="field inline grow">Size
+            <input id="brushSize" type="range" min="4" max="96" value="28">
+          </label>
+        </div>
+        <div class="row">
+          <button type="button" id="clearMask" class="button">Clear</button>
+          <label class="button">Upload mask<input id="maskFile" type="file" accept="image/png,image/jpeg" hidden></label>
+          <label class="check"><input id="showMask" type="checkbox" checked> Show</label>
+        </div>
+        <p class="coverage">Coverage <strong id="coverage">0.0%</strong> <span id="maskNote" class="hint"></span></p>
+      </div>
+
+      <button type="button" id="runBtn" class="button primary wide" disabled>Restore image</button>
+      <div id="status" class="status" role="status" aria-live="polite"></div>
+    </section>
+
+    <section class="panel viewer" aria-label="Images">
+      <div class="compare">
+        <figure>
+          <figcaption>Input <span id="inputDims" class="dims"></span></figcaption>
+          <div class="stage" id="inputStage">
+            <canvas id="imageCanvas"></canvas>
+            <canvas id="maskCanvas"></canvas>
+            <div id="inputPlaceholder" class="placeholder">Upload an image or choose a benchmark example</div>
+          </div>
+        </figure>
+        <figure>
+          <figcaption>Output <span id="outputDims" class="dims"></span></figcaption>
+          <div class="stage">
+            <img id="outputImg" alt="Restored output" hidden>
+            <div id="outputPlaceholder" class="placeholder">The restored image appears here</div>
+          </div>
+        </figure>
+      </div>
+      <div id="resultBox" class="result" hidden>
+        <table id="infoTable"></table>
+        <div class="result-actions">
+          <a id="downloadBtn" class="button primary" href="#" download>Download PNG</a>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script src="static/app.js"></script>
+</body>
+</html>

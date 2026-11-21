@@ -1,0 +1,13 @@
+# Web application + inpainting inference (PyTorch is installed separately for your CUDA version)
+flask>=3.0
+waitress>=3.0
+pillow>=10.0
+numpy>=1.26
+opencv-python-headless>=4.8
+scikit-image>=0.22
+diffusers>=0.32
+transformers>=4.40
+accelerate>=0.30
+peft>=0.14
+safetensors>=0.4
+lpips>=0.1.4  # optional, used for model-selection metrics only
