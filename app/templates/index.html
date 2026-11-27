@@ -43,12 +43,28 @@
 
       <div class="step">
         <h2><span class="num">2</span> Task</h2>
-        <div id="taskList" class="task-grid" role="radiogroup" aria-label="Restoration task"></div>
-        <label class="field">Method
-          <select id="methodSelect"></select>
-        </label>
-        <p id="methodDesc" class="hint"></p>
-        <p id="methodMissing" class="hint warn" hidden></p>
+        <div class="segmented" role="tablist" aria-label="Run one task or a pipeline">
+          <button type="button" class="seg active" data-mode="single" role="tab" aria-selected="true">One task</button>
+          <button type="button" class="seg" data-mode="pipeline" role="tab" aria-selected="false">Pipeline</button>
+        </div>
+        <div id="singlePane">
+          <div id="taskList" class="task-grid" role="radiogroup" aria-label="Restoration task"></div>
+          <label class="field">Method
+            <select id="methodSelect"></select>
+          </label>
+          <p id="methodDesc" class="hint"></p>
+          <p id="methodMissing" class="hint warn" hidden></p>
+        </div>
+        <div id="pipelinePane" hidden>
+          <p class="hint">Steps run top to bottom; each one works on the previous step's result.
+            Drag <span aria-hidden="true">⠿</span> or use ↑ ↓ to change the order.</p>
+          <ol id="pipelineList" class="pipeline" aria-label="Pipeline steps"></ol>
+          <div class="row">
+            <select id="addStepSelect" aria-label="Task to add"></select>
+            <button type="button" id="addStepBtn" class="button">Add step</button>
+          </div>
+          <p id="pipelineWarn" class="hint warn" hidden></p>
+        </div>
         <label id="seedRow" class="field inline">Seed
           <input id="seedInput" type="number" value="42" step="1">
         </label>
@@ -96,6 +112,7 @@
         </figure>
       </div>
       <div id="resultBox" class="result" hidden>
+        <div id="stepStrip" class="step-strip" hidden aria-label="Result after each step"></div>
         <table id="infoTable"></table>
         <div class="result-actions">
           <a id="downloadBtn" class="button primary" href="#" download>Download PNG</a>

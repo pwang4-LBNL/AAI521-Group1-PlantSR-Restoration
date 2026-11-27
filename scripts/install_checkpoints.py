@@ -7,7 +7,7 @@
 Accepted inputs
   --denoise, --colorize   Jinyuan's best.pth, or the Drive ZIP that contains it (Denoise/best.pth)
   --sr                    Peng's PlantSR_x4_app.zip (or its extracted folder); --download-sr fetches it
-                          from Peng's Drive link (docs/model_provenance.md) with gdown
+                          from Peng's Drive link (docs/super_resolution.md) with gdown
   --inpaint-lora          a LoRA folder or ZIP with pytorch_lora_weights.safetensors (+ trial_config.json)
 
 Destinations (all ignored by Git)
@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SR_DRIVE_ID = "1j4plR5Zc-MUNYD42HYTR-lCmgLLjZ-VA"  # Peng's PlantSR_x4_app.zip (docs/model_provenance.md)
+SR_DRIVE_ID = "1j4plR5Zc-MUNYD42HYTR-lCmgLLjZ-VA"  # Peng's PlantSR_x4_app.zip (docs/super_resolution.md)
 
 
 def sha256(path: Path) -> str:
@@ -108,6 +108,24 @@ def install_lora(source: Path, workdir: Path) -> None:
     print(f"Inpainting LoRA  -> {target.relative_to(ROOT)}  sha256 {sha256(target / weights.name)[:12]}…")
 
 
+def download_sr(target: Path) -> Path | None:
+    """Fetch Peng's bundle; if the Drive link is not public, explain and carry on without it."""
+    try:
+        import gdown
+
+        gdown.download(id=SR_DRIVE_ID, output=str(target), quiet=False)
+        if target.is_file() and zipfile.is_zipfile(target):
+            return target
+        problem = "the download did not produce a ZIP file"
+    except Exception as exc:  # noqa: BLE001 - gdown raises several types for permission problems
+        problem = f"{type(exc).__name__}: {str(exc).strip().splitlines()[0]}"
+    print("WARNING: could not download Peng's PlantSR_x4_app.zip "
+          f"({problem}).\n  The Drive link is probably not shared as 'Anyone with the link'. Download it in a "
+          "browser from docs/super_resolution.md and pass it with --sr. Continuing without the fine-tuned "
+          "super-resolution models.")
+    return None
+
+
 def status() -> int:
     sys.path.insert(0, str(ROOT))
     from src.inference.factory import build_registry
@@ -146,10 +164,7 @@ def main(argv=None) -> None:
                 install_file(find_member(args.colorize, "best.pth", work / "cz"), ROOT / cfg["colorization"]["checkpoint"],
                              cfg["colorization"].get("sha256"), "Colorization", args.force)
             if args.download_sr and not args.sr:
-                import gdown
-
-                args.sr = work / "PlantSR_x4_app.zip"
-                gdown.download(id=SR_DRIVE_ID, output=str(args.sr), quiet=False)
+                args.sr = download_sr(work / "PlantSR_x4_app.zip")
             if args.sr:
                 install_sr(args.sr, work)
             if args.inpaint_lora:

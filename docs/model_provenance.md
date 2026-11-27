@@ -15,8 +15,9 @@ Git; `scripts/install_checkpoints.py` installs and verifies them (`docs/deployme
 | Inpainting | `sd15_finetuned` | same + PlantSR LoRA | full LoRA fine-tune (C2), **not trained yet** | `checkpoints/inpaint/lora/` | Ali |
 | all | `opencv_nlmeans`, `bicubic_x4`, `grayscale_rgb`, `opencv_telea`, `opencv_ns` | classical baselines, no weights | — | — | — |
 
-Super-resolution bundle: Peng's `PlantSR_x4_app.zip` in the team Drive (Google Drive file id
-`1j4plR5Zc-MUNYD42HYTR-lCmgLLjZ-VA`, used by `install_checkpoints.py --download-sr`). Its
+Super-resolution bundle: Peng's `PlantSR_x4_app.zip`, linked from `docs/super_resolution.md` (Google Drive
+file id `1j4plR5Zc-MUNYD42HYTR-lCmgLLjZ-VA`, used by `install_checkpoints.py --download-sr`). Peng's own
+validation and test results are in `reports/super_resolution/`. Its
 `plantsr_sr/models.py` and `inference.py` are committed in the repository; a test checks that they are
 identical to the code Peng's notebook exports.
 

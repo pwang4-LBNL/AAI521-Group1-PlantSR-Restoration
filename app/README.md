@@ -15,6 +15,11 @@ Flask application and user interface for the four restoration tasks.
   `max_gpu_models` models loaded and retries once after freeing memory if the GPU runs out.
 - Side-by-side input/output, received → processed → output dimensions, model version, timing and notes
   (e.g. "processed in tiles", "converted to grayscale first").
+- **Pipeline mode:** chain up to four tasks in any order (e.g. denoising → colorization → inpainting). Drag the ⠿
+  handle or use ↑ ↓ to reorder, ✕ to remove, "Add step" to add a task back, and pick a model per step. The steps run
+  as one queued job, each on the previous step's output; the result shows every intermediate image (each downloadable)
+  and per-step details. If inpainting comes after super-resolution, the mask is resized to the 4× image. Pipelines run
+  on uploads only, because benchmark scores are defined for one task at a time.
 - PSNR/SSIM (and ΔE00 for colorization) shown **only** for benchmark examples, where the reference is known.
 - PNG download, and a 1–5 rating with an optional comment for user testing (`logs/feedback.csv`; every job is
   also logged to `logs/jobs.csv`, without images).
@@ -44,5 +49,7 @@ On Colab, `notebooks/PlantSR_App_Integration.ipynb` section 9 starts the app and
 | POST | `/api/jobs` | Form fields `task`, `method`, `seed`, `source` (`upload`/`example`), `image`, `mask`, `example_id`, optional `tester`, `session` |
 | GET | `/api/jobs/<id>` | Status, timing, sizes, metrics |
 | GET | `/api/jobs/<id>/output.png[?download=1]` | Result |
+| POST | `/api/jobs` with `task=pipeline` | `steps` = JSON list of `{"task", "method"}` in run order (each task at most once), `image`, `mask` if a step is inpainting, `seed` |
+| GET | `/api/jobs/<id>/steps/<n>.png` | Result after pipeline step *n* (`?download=1` to save) |
 | POST | `/api/feedback` | JSON `job_id`, `rating` (1–5), optional `comment`, `tester`, `session` |
 | GET | `/api/health` | Device, queue length, loaded models, defaults, methods not installed |

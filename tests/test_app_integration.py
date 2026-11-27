@@ -285,5 +285,94 @@ def test_logging_is_off_without_a_log_dir(tmp_path, monkeypatch):
     assert not list(tmp_path.rglob("*.csv"))
 
 
+# --------------------------------------------------------------------------- pipelines
+def _pipeline(client, steps, image, mask=None, **extra):
+    data = {"task": "pipeline", "steps": json.dumps(steps), "source": "upload", "session": "s", "tester": "T2",
+            "image": (io.BytesIO(_png(image)), "photo.png"), **extra}
+    if mask is not None:
+        data["mask"] = (io.BytesIO(_png(mask)), "mask.png")
+    return client.post("/api/jobs", content_type="multipart/form-data", data=data)
+
+
+def test_pipeline_runs_steps_in_order_and_keeps_each_result(tmp_path):
+    client = create_app(build_registry(with_models=False), log_dir=tmp_path).test_client()
+    photo = _photo(40, 48)
+    mask = np.zeros((40, 48), np.uint8)
+    mask[10:20, 12:30] = 255
+    steps = [{"task": "denoising"}, {"task": "colorization"}, {"task": "inpainting", "method": "opencv_telea"}]
+    reply = _pipeline(client, steps, photo, mask)
+    assert reply.status_code == 202, reply.get_json()
+    job = _wait(client, reply.get_json()["id"])
+    assert job["status"] == "done", job["error"]
+    assert [s["task"] for s in job["result"]["steps"]] == ["denoising", "colorization", "inpainting"]
+    assert job["method"] == "denoising:opencv_nlmeans > colorization:grayscale_rgb > inpainting:opencv_telea"
+    assert len(job["step_urls"]) == 3
+
+    after_color = np.asarray(Image.open(io.BytesIO(client.get("/" + job["step_urls"][1]).data)).convert("RGB"))
+    final = np.asarray(Image.open(io.BytesIO(client.get("/" + job["output_url"]).data)).convert("RGB"))
+    assert np.array_equal(after_color[mask == 0], final[mask == 0]), "inpainting must only change the masked area"
+    assert np.array_equal(final, np.asarray(Image.open(io.BytesIO(client.get("/" + job["step_urls"][2]).data))))
+
+    row = next(csv.DictReader((tmp_path / "jobs.csv").open(encoding="utf-8")))
+    assert row["task"] == "pipeline" and row["status"] == "done" and row["output_size"] == "48x40"
+
+
+def test_pipeline_order_matters_and_mask_follows_super_resolution(tmp_path):
+    client = create_app(build_registry(with_models=False)).test_client()
+    photo = _photo(24, 32)
+    mask = np.zeros((24, 32), np.uint8)
+    mask[4:10, 6:16] = 255
+    steps = [{"task": "super_resolution"}, {"task": "inpainting", "method": "opencv_telea"}]
+    job = _wait(client, _pipeline(client, steps, photo, mask).get_json()["id"])
+    assert job["status"] == "done", job["error"]
+    assert job["result"]["output_size"] == [128, 96]
+    assert any("mask was resized to 128×96" in n for n in job["result"]["notes"])
+    upscaled = np.asarray(Image.open(io.BytesIO(client.get("/" + job["step_urls"][0]).data)).convert("RGB"))
+    final = np.asarray(Image.open(io.BytesIO(client.get("/" + job["output_url"]).data)).convert("RGB"))
+    big_mask = np.kron(mask > 0, np.ones((4, 4), bool))
+    assert np.array_equal(upscaled[~big_mask], final[~big_mask])
+
+    reverse = _wait(client, _pipeline(client, steps[::-1], photo, mask).get_json()["id"])
+    assert reverse["status"] == "done" and not reverse["result"]["notes"]
+    assert reverse["result"]["steps"][0]["output_size"] == [32, 24]
+
+
+def test_pipeline_requests_are_validated():
+    client = create_app(build_registry(with_models=False)).test_client()
+    photo = _photo(16, 16)
+    cases = [
+        ([], "at least one step"),
+        ([{"task": "denoising"}, {"task": "denoising"}], "twice"),
+        ([{"task": "sharpening"}], "Unknown pipeline step"),
+        ([{"task": "inpainting"}], "mask"),
+        ([{"task": "denoising", "method": "nope"}], ""),
+    ]
+    for steps, message in cases:
+        reply = _pipeline(client, steps, photo)
+        assert reply.status_code == 400, steps
+        assert message in reply.get_json()["error"]
+    example = _pipeline(client, [{"task": "denoising"}], photo, source="example")
+    assert example.status_code == 400 and "benchmark" in example.get_json()["error"].lower()
+
+
+class _Broken(TaskHandler):
+    task, method, label, description = "colorization", "broken", "broken", "always fails"
+
+    def run(self, image, mask, seed):
+        raise ValueError("boom")
+
+
+def test_pipeline_stops_at_a_failing_step_and_keeps_earlier_results():
+    registry = build_registry(with_models=False)
+    registry.register(_Broken())
+    client = create_app(registry).test_client()
+    steps = [{"task": "denoising"}, {"task": "colorization", "method": "broken"}, {"task": "super_resolution"}]
+    job = _wait(client, _pipeline(client, steps, _photo(16, 16)).get_json()["id"])
+    assert job["status"] == "error" and job["error"].startswith("Step 2 (colorization) failed")
+    assert len(job["step_urls"]) == 1 and len(job["result"]["steps"]) == 2
+    assert client.get("/" + job["step_urls"][0]).status_code == 200
+    assert client.get(f"/api/jobs/{job['id']}/output.png").status_code == 404
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

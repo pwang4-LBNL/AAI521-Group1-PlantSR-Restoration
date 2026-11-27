@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import json
 import sys
 import threading
 import time
@@ -31,6 +32,7 @@ from src.inference.interface import TASKS, Registry, normalize_mask  # noqa: E40
 ALLOWED_FORMATS = {"JPEG", "PNG"}
 MAX_PIXELS = 40_000_000
 KEEP_JOBS = 100
+MAX_PIPELINE_STEPS = 4
 
 
 def read_upload(storage, what: str = "image") -> Image.Image:
@@ -50,6 +52,39 @@ def read_upload(storage, what: str = "image") -> Image.Image:
         return image
     except (UnidentifiedImageError, OSError) as exc:
         raise ValueError(f"The {what} could not be read as a JPG or PNG file.") from exc
+
+
+def parse_steps(raw: str, registry: Registry) -> list[dict]:
+    """Validate a pipeline: a JSON list of {"task", "method"} run in order, each task at most once."""
+    try:
+        steps = json.loads(raw or "[]")
+    except json.JSONDecodeError as exc:
+        raise ValueError("The pipeline could not be read.") from exc
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("Add at least one step to the pipeline.")
+    if len(steps) > MAX_PIPELINE_STEPS:
+        raise ValueError(f"A pipeline can have at most {MAX_PIPELINE_STEPS} steps.")
+    clean, seen = [], set()
+    for step in steps:
+        task = step.get("task") if isinstance(step, dict) else None
+        if task not in TASKS:
+            raise ValueError(f"Unknown pipeline step: {task!r}.")
+        if task in seen:
+            raise ValueError(f"{task.replace('_', '-')} appears twice in the pipeline.")
+        seen.add(task)
+        handler = registry.handler(task, step.get("method") or None)
+        clean.append({"task": task, "method": handler.method, "needs_mask": handler.needs_mask})
+    return clean
+
+
+def resize_mask(mask, size: tuple[int, int]):
+    """Nearest-neighbour resize of a 0/1 mask, e.g. after super-resolution made the image 4x larger."""
+    import numpy as np
+
+    if mask is None or (mask.shape[1], mask.shape[0]) == tuple(size):
+        return mask
+    return (np.asarray(Image.fromarray((mask > 0).astype(np.uint8) * 255).resize(size, Image.Resampling.NEAREST))
+            > 127).astype(np.uint8)
 
 
 def png_bytes(image: Image.Image) -> bytes:
@@ -145,6 +180,9 @@ class JobQueue:
                 if job is None:
                     continue
                 job["status"], job["started_at"] = "running", time.time()
+            if job["task"] == "pipeline":
+                self._run_pipeline(job)
+                continue
             result = self.registry.restore(job.pop("_image"), job["task"], job.pop("_mask", None),
                                            seed=job["seed"], method=job["method"])
             job["result"] = result.metadata()
@@ -158,11 +196,46 @@ class JobQueue:
                         job["metrics"] = {"note": f"metrics unavailable: {exc}"}
             job["error"] = result.error
             job["status"] = "done" if result.success else "error"
-            job["finished_at"] = time.time()
-            try:
-                self.log.job(job)
-            except OSError:
-                pass  # logging must never break a request
+            self._finish(job)
+
+    def _finish(self, job: dict) -> None:
+        job["finished_at"] = time.time()
+        try:
+            self.log.job(job)
+        except OSError:
+            pass  # logging must never break a request
+
+    def _run_pipeline(self, job: dict) -> None:
+        """Run the steps in order; each step gets the previous step's output. Stops at the first failure."""
+        image, mask = job.pop("_image"), job.pop("_mask", None)
+        first_size, steps, notes, total = list(image.size), [], [], 0.0
+        job["_step_png"] = []
+        for index, step in enumerate(job["steps"], start=1):
+            job["progress"] = {"step": index, "total": len(job["steps"]), "task": step["task"]}
+            step_mask = resize_mask(mask, image.size) if step["needs_mask"] else None
+            if step_mask is not None and step_mask is not mask:
+                notes.append(f"Step {index}: the mask was resized to {image.width}×{image.height} "
+                             "to match the image from the previous step.")
+            result = self.registry.restore(image, step["task"], step_mask, seed=job["seed"], method=step["method"])
+            total += result.elapsed_seconds
+            steps.append(result.metadata())
+            if not result.success:
+                job["error"] = f"Step {index} ({step['task'].replace('_', '-')}) failed: {result.error}"
+                break
+            image = result.image
+            job["_step_png"].append(png_bytes(image))
+        job["result"] = {"task": "pipeline", "method": job["method"], "steps": steps, "notes": notes,
+                         "input_size": first_size, "processed_size": [],
+                         "output_size": list(image.size) if not job["error"] else [],
+                         "elapsed_seconds": round(total, 3),
+                         "model_version": " > ".join(s.get("model_version") or s["method"] for s in steps)}
+        job.pop("progress", None)
+        if job["error"]:
+            job["status"] = "error"
+        else:
+            job["_png"] = job["_step_png"][-1]
+            job["status"] = "done"
+        self._finish(job)
 
 
 def public(job: dict, queue: JobQueue) -> dict:
@@ -170,6 +243,8 @@ def public(job: dict, queue: JobQueue) -> dict:
     data["queue_position"] = queue.position(job["id"]) if job["status"] == "queued" else 0
     if job["status"] == "done":
         data["output_url"] = f"api/jobs/{job['id']}/output.png"
+    if job.get("_step_png"):
+        data["step_urls"] = [f"api/jobs/{job['id']}/steps/{i}.png" for i in range(1, len(job["_step_png"]) + 1)]
     return data
 
 
@@ -232,6 +307,8 @@ def create_app(registry: Registry, examples=None, max_upload_mb: int = 25, log_d
     def submit():
         form = request.form
         task = form.get("task", "")
+        if task == "pipeline":
+            return submit_pipeline(form)
         try:
             if task not in TASKS:
                 raise ValueError(f"Choose a task: {', '.join(TASKS)}.")
@@ -265,6 +342,44 @@ def create_app(registry: Registry, examples=None, max_upload_mb: int = 25, log_d
         job = queue.submit(job)
         return jsonify(public(job, queue)), 202
 
+    def submit_pipeline(form):
+        try:
+            steps = parse_steps(form.get("steps"), registry)
+            if form.get("source", "upload") != "upload":
+                raise ValueError("Pipelines run on uploaded images; benchmark examples score one task at a time.")
+            try:
+                seed = int(form.get("seed", 42))
+            except ValueError as exc:
+                raise ValueError("The seed must be a whole number.") from exc
+            image = read_upload(request.files.get("image"))
+            mask = None
+            job = {"task": "pipeline", "steps": steps, "seed": seed, "source": "upload",
+                   "method": " > ".join(f"{s['task']}:{s['method']}" for s in steps),
+                   "session": clean_text(form.get("session"), 40), "tester": clean_text(form.get("tester"), 40)}
+            if any(s["needs_mask"] for s in steps):
+                if not request.files.get("mask"):
+                    raise ValueError("The pipeline includes inpainting: paint or upload a mask first.")
+                mask_image = read_upload(request.files.get("mask"), "mask")
+                if mask_image.size != image.size:
+                    job["mask_resized"] = True
+                mask = normalize_mask(mask_image, image.size)
+            job["input_size"] = list(image.size)
+            job["_image"], job["_mask"] = image, mask
+        except (ValueError, KeyError) as exc:
+            return jsonify(error=str(exc).strip("'\"")), 400
+        job = queue.submit(job)
+        return jsonify(public(job, queue)), 202
+
+    @app.get("/api/jobs/<job_id>/steps/<int:index>.png")
+    def job_step_output(job_id, index):
+        job = queue.jobs.get(job_id)
+        pngs = (job or {}).get("_step_png") or []
+        if not 1 <= index <= len(pngs):
+            return jsonify(error="No output for this step."), 404
+        name = f"plantsr_pipeline_step{index}_{job['steps'][index - 1]['task']}_{job_id}.png"
+        return send_file(io.BytesIO(pngs[index - 1]), mimetype="image/png",
+                         as_attachment=request.args.get("download") == "1", download_name=name)
+
     @app.get("/api/jobs/<job_id>")
     def job_status(job_id):
         job = queue.jobs.get(job_id)
@@ -277,7 +392,8 @@ def create_app(registry: Registry, examples=None, max_upload_mb: int = 25, log_d
         job = queue.jobs.get(job_id)
         if job is None or "_png" not in job:
             return jsonify(error="No output for this job."), 404
-        name = f"plantsr_{job['task']}_{job['method']}_{job_id}.png"
+        name = (f"plantsr_pipeline_{job_id}.png" if job["task"] == "pipeline"
+                else f"plantsr_{job['task']}_{job['method']}_{job_id}.png")
         return send_file(io.BytesIO(job["_png"]), mimetype="image/png",
                          as_attachment=request.args.get("download") == "1", download_name=name)
 

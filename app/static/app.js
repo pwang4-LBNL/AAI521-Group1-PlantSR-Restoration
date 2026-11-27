@@ -23,7 +23,11 @@ const state = {
   coverage: 0, busy: false, jobId: null, pollTimer: null, submitted: null,
   session: (window.crypto && crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2)).slice(0, 12),
   rating: 0,
+  mode: "single",
+  pipeline: [],  // [{task, method}] in run order
+  dragIndex: null,
 };
+const DEFAULT_PIPELINE = ["denoising", "colorization", "inpainting"];
 
 function storage(key, value) {  // localStorage can be unavailable; never let it break the page
   try {
@@ -70,6 +74,39 @@ function currentMethod() {
   return task && task.methods.find((m) => m.method === $("methodSelect").value);
 }
 
+function taskInfo(name) {
+  return state.tasks.find((t) => t.task === name);
+}
+
+// Does the job about to run need a mask? (one inpainting task, or a pipeline with an inpainting step)
+function needsMask() {
+  if (state.mode === "pipeline") return state.pipeline.some((s) => taskInfo(s.task) && taskInfo(s.task).needs_mask);
+  return Boolean(currentTask() && currentTask().needs_mask);
+}
+
+function fillMethodOptions(select, task, value) {
+  select.textContent = "";
+  for (const kind of ["finetuned", "pretrained", "baseline"]) {
+    const methods = task.methods.filter((m) => (m.kind || "baseline") === kind);
+    if (!methods.length) continue;
+    const group = document.createElement("optgroup");
+    group.label = KIND_LABELS[kind];
+    for (const m of methods) {
+      const option = document.createElement("option");
+      option.value = m.method;
+      option.textContent = m.label + (m.method === task.default_method ? " (default)" : "");
+      group.appendChild(option);
+    }
+    select.appendChild(group);
+  }
+  select.value = value || task.default_method;
+}
+
+function refreshMaskTools() {
+  $("maskTools").hidden = !needsMask();
+  maskCanvas.hidden = !needsMask() || !state.loaded;
+}
+
 function renderTasks() {
   const list = $("taskList");
   list.textContent = "";
@@ -97,29 +134,13 @@ function selectTask(name) {
     b.classList.toggle("active", active);
     b.setAttribute("aria-checked", String(active));
   });
-  const select = $("methodSelect");
-  select.textContent = "";
-  for (const kind of ["finetuned", "pretrained", "baseline"]) {
-    const methods = task.methods.filter((m) => (m.kind || "baseline") === kind);
-    if (!methods.length) continue;
-    const group = document.createElement("optgroup");
-    group.label = KIND_LABELS[kind];
-    for (const m of methods) {
-      const option = document.createElement("option");
-      option.value = m.method;
-      option.textContent = m.label + (m.method === task.default_method ? " (default)" : "");
-      group.appendChild(option);
-    }
-    select.appendChild(group);
-  }
-  select.value = task.default_method;
+  fillMethodOptions($("methodSelect"), task);
   selectMethod();
   const missing = task.unavailable || [];
   $("methodMissing").hidden = !missing.length;
   $("methodMissing").textContent = missing.length
     ? `Not installed on this server: ${missing.map((u) => u.method).join(", ")}.` : "";
-  $("maskTools").hidden = !task.needs_mask;
-  maskCanvas.hidden = !task.needs_mask || !state.loaded;
+  refreshMaskTools();
   if (state.source === "example" && state.exampleId) loadExample(state.exampleId);
   updateRunButton();
 }
@@ -127,7 +148,175 @@ function selectTask(name) {
 function selectMethod() {
   const method = currentMethod();
   $("methodDesc").textContent = method ? method.description : "";
-  $("seedRow").hidden = !(method && method.generative);
+  updateSeedRow();
+}
+
+function updateSeedRow() {
+  let generative;
+  if (state.mode === "pipeline") {
+    generative = state.pipeline.some((s) => {
+      const task = taskInfo(s.task);
+      const m = task && task.methods.find((x) => x.method === s.method);
+      return m && m.generative;
+    });
+  } else {
+    const method = currentMethod();
+    generative = method && method.generative;
+  }
+  $("seedRow").hidden = !generative;
+}
+
+// ---------------------------------------------------------------- pipeline
+function setMode(mode) {
+  if (state.busy || mode === state.mode) return;
+  state.mode = mode;
+  document.querySelectorAll("[data-mode]").forEach((b) => {
+    const active = b.dataset.mode === mode;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", String(active));
+  });
+  $("singlePane").hidden = mode !== "single";
+  $("pipelinePane").hidden = mode !== "pipeline";
+  const exampleTab = document.querySelector('[data-source="example"]');
+  exampleTab.disabled = mode === "pipeline";
+  exampleTab.title = mode === "pipeline" ? "Benchmark examples score one task at a time" : "";
+  if (mode === "pipeline" && state.source === "example") setSource("upload");
+  if (mode === "pipeline" && !state.pipeline.length) {
+    state.pipeline = DEFAULT_PIPELINE.filter((t) => taskInfo(t))
+      .map((t) => ({ task: t, method: taskInfo(t).default_method }));
+  }
+  renderPipeline();
+  refreshMaskTools();
+  updateSeedRow();
+  updateRunButton();
+}
+
+function moveStep(from, to) {
+  if (state.busy || to < 0 || to >= state.pipeline.length || from === to) return;
+  const [step] = state.pipeline.splice(from, 1);
+  state.pipeline.splice(to, 0, step);
+  renderPipeline();
+}
+
+function renderPipeline() {
+  const list = $("pipelineList");
+  list.textContent = "";
+  if (!state.pipeline.length) {
+    const empty = document.createElement("li");
+    empty.className = "pipeline-empty";
+    empty.textContent = "No steps yet. Add a task below.";
+    list.appendChild(empty);
+  }
+  state.pipeline.forEach((step, index) => {
+    const task = taskInfo(step.task);
+    const li = document.createElement("li");
+    li.draggable = !state.busy;
+    li.dataset.index = String(index);
+
+    const handle = document.createElement("span");
+    handle.className = "handle";
+    handle.textContent = "⠿";
+    handle.title = "Drag to reorder";
+    const badge = document.createElement("span");
+    badge.className = "badge";
+    badge.textContent = String(index + 1);
+
+    const body = document.createElement("div");
+    body.className = "step-body";
+    const title = document.createElement("strong");
+    title.textContent = task.label;
+    const select = document.createElement("select");
+    select.setAttribute("aria-label", `Method for step ${index + 1}, ${task.label}`);
+    fillMethodOptions(select, task, step.method);
+    const showTitle = () => { select.title = select.selectedOptions[0] ? select.selectedOptions[0].textContent : ""; };
+    showTitle();
+    select.addEventListener("change", () => { step.method = select.value; showTitle(); updateSeedRow(); });
+    body.append(title, select);
+
+    const actions = document.createElement("div");
+    actions.className = "step-actions";
+    const button = (text, label, onClick, disabled) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = text;
+      b.setAttribute("aria-label", label);
+      b.title = label;
+      b.disabled = disabled;
+      b.addEventListener("click", onClick);
+      actions.appendChild(b);
+    };
+    button("↑", `Move ${task.label} up`, () => moveStep(index, index - 1), index === 0);
+    button("↓", `Move ${task.label} down`, () => moveStep(index, index + 1), index === state.pipeline.length - 1);
+    button("✕", `Remove ${task.label}`, () => {
+      if (state.busy) return;
+      state.pipeline.splice(index, 1);
+      renderPipeline();
+    }, false);
+
+    li.addEventListener("dragstart", (e) => {
+      if (state.busy) { e.preventDefault(); return; }
+      state.dragIndex = index;
+      li.classList.add("dragging");
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", String(index));
+    });
+    li.addEventListener("dragend", () => {
+      state.dragIndex = null;
+      list.querySelectorAll("li").forEach((x) => x.classList.remove("dragging", "drop-before", "drop-after"));
+    });
+    li.addEventListener("dragover", (e) => {
+      if (state.dragIndex === null) return;
+      e.preventDefault();
+      const after = e.clientY > li.getBoundingClientRect().top + li.offsetHeight / 2;
+      li.classList.toggle("drop-after", after);
+      li.classList.toggle("drop-before", !after);
+    });
+    li.addEventListener("dragleave", () => li.classList.remove("drop-before", "drop-after"));
+    li.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const from = state.dragIndex;
+      if (from === null) return;
+      const after = e.clientY > li.getBoundingClientRect().top + li.offsetHeight / 2;
+      let to = index + (after ? 1 : 0);
+      if (from < to) to -= 1;
+      moveStep(from, to);
+    });
+
+    li.append(handle, badge, body, actions);
+    list.appendChild(li);
+  });
+
+  // Tasks not in the pipeline yet can be added (each task at most once).
+  const add = $("addStepSelect");
+  add.textContent = "";
+  const remaining = state.tasks.filter((t) => !state.pipeline.some((s) => s.task === t.task));
+  for (const t of remaining) {
+    const option = document.createElement("option");
+    option.value = t.task;
+    option.textContent = t.label;
+    add.appendChild(option);
+  }
+  add.disabled = $("addStepBtn").disabled = !remaining.length || state.busy;
+
+  const srIndex = state.pipeline.findIndex((s) => s.task === "super_resolution");
+  const warn = $("pipelineWarn");
+  warn.hidden = srIndex < 0 || srIndex === state.pipeline.length - 1;
+  warn.textContent = warn.hidden ? "" : "Super-resolution makes the image 4× larger, so the steps after it take "
+    + "longer (and inpainting resizes your mask to match). It usually works best as the last step.";
+  refreshMaskTools();
+  updateSeedRow();
+  updateRunButton();
+}
+
+function addStep() {
+  const name = $("addStepSelect").value;
+  if (state.busy || !name || state.pipeline.some((s) => s.task === name)) return;
+  state.pipeline.push({ task: name, method: taskInfo(name).default_method });
+  renderPipeline();
+}
+
+function pipelineLabel(steps) {
+  return steps.map((s) => (taskInfo(s.task) || { label: s.task }).label).join(" → ");
 }
 
 // ---------------------------------------------------------------- image loading
@@ -143,7 +332,7 @@ function showImage(img) {
   state.loaded = true;
   $("inputPlaceholder").hidden = true;
   imageCanvas.hidden = false;
-  maskCanvas.hidden = !(currentTask() && currentTask().needs_mask);
+  maskCanvas.hidden = !needsMask();
   $("inputDims").textContent = `${w}×${h}`;
   fitCanvas();
   updateCoverage();
@@ -367,7 +556,8 @@ function setBusy(busy) {
   state.busy = busy;
   document.body.classList.toggle("busy", busy);
   const controls = document.querySelectorAll(
-    ".task, [data-source], #fileInput, #exampleSelect, #methodSelect, #seedInput, [data-tool], #clearMask, #maskFile");
+    ".task, [data-source], [data-mode], #fileInput, #exampleSelect, #methodSelect, #seedInput, [data-tool], "
+    + "#clearMask, #maskFile, #pipelineList button, #pipelineList select, #addStepSelect, #addStepBtn");
   controls.forEach((el) => {
     if (busy) {
       el.dataset.wasDisabled = el.disabled ? "1" : "";
@@ -378,14 +568,18 @@ function setBusy(busy) {
     }
   });
   $("dropzone").classList.toggle("disabled", busy);
+  document.querySelectorAll("#pipelineList li").forEach((li) => { li.draggable = !busy; });
   updateRunButton();
 }
 
 function updateRunButton() {
-  const task = currentTask();
-  const needsMask = task && task.needs_mask && state.source === "upload";
-  $("runBtn").disabled = state.busy || !state.loaded || !task || (needsMask && state.coverage <= 0);
-  $("runBtn").title = needsMask && state.coverage <= 0 ? "Paint the area to fill first" : "";
+  const pipeline = state.mode === "pipeline";
+  const ready = pipeline ? state.pipeline.length > 0 : Boolean(currentTask());
+  const maskMissing = needsMask() && state.source === "upload" && state.coverage <= 0;
+  $("runBtn").disabled = state.busy || !state.loaded || !ready || maskMissing;
+  $("runBtn").textContent = pipeline
+    ? `Run pipeline (${state.pipeline.length} step${state.pipeline.length === 1 ? "" : "s"})` : "Restore image";
+  $("runBtn").title = maskMissing ? "Paint the area to fill first" : pipeline && !ready ? "Add at least one step" : "";
 }
 
 function resetOutput() {
@@ -394,9 +588,12 @@ function resetOutput() {
   $("outputPlaceholder").hidden = false;
   $("outputDims").textContent = "";
   $("resultBox").hidden = true;
+  $("stepStrip").hidden = true;
+  $("stepStrip").textContent = "";
 }
 
 async function runJob() {
+  if (state.mode === "pipeline") return runPipeline();
   const form = new FormData();
   form.append("task", state.task);
   form.append("method", $("methodSelect").value);
@@ -428,6 +625,31 @@ async function runJob() {
   }
 }
 
+async function runPipeline() {
+  const steps = state.pipeline.map((s) => ({ task: s.task, method: s.method }));
+  const form = new FormData();
+  form.append("task", "pipeline");
+  form.append("steps", JSON.stringify(steps));
+  form.append("seed", $("seedInput").value || "42");
+  form.append("source", "upload");
+  form.append("session", state.session);
+  form.append("tester", $("testerId").value.trim());
+  form.append("image", state.file, state.file.name);
+  if (needsMask()) form.append("mask", await maskBlob(), "mask.png");
+  state.submitted = { steps, input: state.file.name };
+  setBusy(true);
+  resetOutput();
+  setStatus("Uploading…", "", true);
+  try {
+    const job = await api("api/jobs", { method: "POST", body: form });
+    state.jobId = job.id;
+    poll();
+  } catch (err) {
+    setBusy(false);
+    setStatus(err.message, "error");
+  }
+}
+
 async function poll() {
   clearTimeout(state.pollTimer);
   try {
@@ -436,7 +658,9 @@ async function poll() {
       setStatus(`Queued${job.queue_position > 1 ? ` (position ${job.queue_position})` : ""}…`, "", true);
     } else if (job.status === "running") {
       const seconds = (Date.now() / 1000 - job.started_at).toFixed(1);
-      setStatus(`Processing… ${seconds}s`, "", true);
+      const p = job.progress;
+      const label = p ? (taskInfo(p.task) || { label: p.task }).label : "";
+      setStatus(p ? `Step ${p.step} of ${p.total}: ${label}… ${seconds}s` : `Processing… ${seconds}s`, "", true);
     }
     if (job.status === "done" || job.status === "error") {
       refreshHealth();  // update the queue count and loaded models right away
@@ -451,8 +675,115 @@ async function poll() {
   state.pollTimer = setTimeout(poll, 700);
 }
 
+function showOutput(url, size) {
+  const img = $("outputImg");
+  img.onload = () => {
+    const shown = Math.min(img.clientWidth / img.naturalWidth, img.clientHeight / img.naturalHeight);
+    img.classList.toggle("pixelated", shown >= 2);
+    $("outputDims").textContent = size ? dims(size) : `${img.naturalWidth}×${img.naturalHeight}`;
+  };
+  img.src = `${url}?t=${Date.now()}`;
+  img.hidden = false;
+  $("outputPlaceholder").hidden = true;
+}
+
+function infoRows(rows) {
+  const table = $("infoTable");
+  table.textContent = "";
+  for (const [label, value, cls] of rows) {
+    const tr = table.insertRow();
+    if (cls) tr.className = cls;
+    const th = document.createElement("th");
+    th.textContent = label;
+    tr.appendChild(th);
+    tr.insertCell().textContent = value;
+  }
+}
+
+function finishPipeline(job) {
+  const r = job.result || {};
+  const steps = r.steps || [];
+  const urls = job.step_urls || [];
+  const strip = $("stepStrip");
+  strip.textContent = "";
+  urls.forEach((url, i) => {
+    const step = steps[i] || {};
+    const fig = document.createElement("figure");
+    const thumb = document.createElement("button");
+    thumb.type = "button";
+    thumb.className = `thumb${i === urls.length - 1 ? " active" : ""}`;
+    thumb.title = "Show this step's result";
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = `Result after step ${i + 1}`;
+    thumb.appendChild(img);
+    thumb.addEventListener("click", () => {
+      strip.querySelectorAll(".thumb").forEach((t) => t.classList.toggle("active", t === thumb));
+      showOutput(url, step.output_size);
+    });
+    const cap = document.createElement("figcaption");
+    const name = document.createElement("span");
+    name.textContent = `${i + 1}. ${(taskInfo(step.task) || { label: step.task }).label}`;
+    const link = document.createElement("a");
+    link.href = `${url}?download=1`;
+    link.textContent = "PNG";
+    link.setAttribute("download", "");
+    cap.append(name, link);
+    fig.append(thumb, cap);
+    strip.appendChild(fig);
+  });
+  strip.hidden = !urls.length;
+
+  const wait = job.started_at - job.created_at;
+  if (job.status === "error") {
+    setStatus(job.error || "The pipeline failed.", "error");
+  } else {
+    setStatus(`Done: ${steps.length} steps in ${r.elapsed_seconds.toFixed(2)}s`
+      + `${wait > 0.5 ? ` (waited ${wait.toFixed(1)}s in queue)` : ""}`, "done");
+  }
+  if (urls.length) showOutput(urls[urls.length - 1], steps[urls.length - 1] && steps[urls.length - 1].output_size);
+
+  const rows = [
+    ["Task", "Pipeline"],
+    ["Steps", pipelineLabel(job.steps || [])],
+    ["Input", state.submitted ? state.submitted.input : "—"],
+    ["Received", dims(r.input_size)],
+    ["Output", job.status === "done" ? dims(r.output_size) : "—"],
+    ["Total inference time", `${(r.elapsed_seconds || 0).toFixed(2)} s`],
+  ];
+  if ((job.steps || []).some((s) => s.needs_mask)) rows.push(["Seed", String(job.seed)]);
+  (r.notes || []).forEach((note) => rows.push(["Note", note]));
+  steps.forEach((step, i) => {
+    const task = taskInfo(step.task) || { label: step.task, methods: [] };
+    const method = task.methods.find((m) => m.method === step.method);
+    rows.push([`Step ${i + 1} · ${task.label}`, step.success ? "" : "failed", "section"]);
+    rows.push(["Method", method ? method.label : step.method]);
+    if (step.success) {
+      rows.push(["Model version", step.model_version]);
+      rows.push(["Size", `${dims(step.input_size)} → processed ${dims(step.processed_size)} → ${dims(step.output_size)}`]);
+      rows.push(["Time", `${step.elapsed_seconds.toFixed(2)} s`]);
+      if (step.mask_coverage !== undefined) rows.push(["Mask coverage", `${(step.mask_coverage * 100).toFixed(2)}%`]);
+      (step.notes || []).forEach((note) => rows.push(["Note", note]));
+    } else {
+      rows.push(["Error", step.error || "failed"]);
+    }
+  });
+  infoRows(rows);
+  const download = $("downloadBtn");
+  download.hidden = job.status !== "done";
+  if (job.status === "done") {
+    download.href = `${job.output_url}?download=1`;
+    download.setAttribute("download", `plantsr_pipeline_${job.id}.png`);
+  }
+  $("resultBox").hidden = false;
+  resetFeedback();
+  $("feedbackForm").hidden = job.status !== "done";
+}
+
 function finish(job) {
   const r = job.result || {};
+  if (job.task === "pipeline") return finishPipeline(job);
+  $("downloadBtn").hidden = false;
   if (job.status === "error") {
     setStatus(job.error || "The restoration failed.", "error");
     return;
@@ -592,6 +923,8 @@ async function init() {
   $("methodSelect").addEventListener("change", selectMethod);
   $("exampleSelect").addEventListener("change", (e) => loadExample(e.target.value));
   $("runBtn").addEventListener("click", runJob);
+  document.querySelectorAll("[data-mode]").forEach((b) => b.addEventListener("click", () => setMode(b.dataset.mode)));
+  $("addStepBtn").addEventListener("click", addStep);
   document.querySelectorAll("[data-rating]").forEach((b) => b.addEventListener("click", () => {
     state.rating = Number(b.dataset.rating);
     document.querySelectorAll("[data-rating]").forEach((x) => x.classList.toggle("active", x === b));

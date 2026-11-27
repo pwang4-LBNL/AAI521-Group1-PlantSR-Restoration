@@ -123,7 +123,9 @@ with the ID (testers can also type it into the feedback form; it is remembered i
 2. Run **super-resolution** on a small photo or a benchmark example.
 3. Run **colorization** on any photo (the app converts it to grayscale first and says so).
 4. Run **inpainting**: paint over part of a leaf (or upload a mask), run it, download the result.
-5. After each result, give a 1–5 rating and say what was confusing, slow or wrong.
+5. Switch to **Pipeline**, arrange denoising → colorization → inpainting (or your own order), paint a mask, run it,
+   and look at each step's result.
+6. After each result, give a 1–5 rating and say what was confusing, slow or wrong.
 
 **Recorded automatically** (no images are stored):
 
