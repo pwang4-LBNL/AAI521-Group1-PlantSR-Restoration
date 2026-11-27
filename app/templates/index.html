@@ -48,6 +48,7 @@
           <select id="methodSelect"></select>
         </label>
         <p id="methodDesc" class="hint"></p>
+        <p id="methodMissing" class="hint warn" hidden></p>
         <label id="seedRow" class="field inline">Seed
           <input id="seedInput" type="number" value="42" step="1">
         </label>
@@ -99,6 +100,25 @@
         <div class="result-actions">
           <a id="downloadBtn" class="button primary" href="#" download>Download PNG</a>
         </div>
+        <form id="feedbackForm" class="feedback" autocomplete="off">
+          <p class="feedback-title">How good is this result?</p>
+          <div class="rating" role="radiogroup" aria-label="Rating from 1 (poor) to 5 (excellent)">
+            <button type="button" data-rating="1" aria-label="1, poor">1</button>
+            <button type="button" data-rating="2" aria-label="2">2</button>
+            <button type="button" data-rating="3" aria-label="3">3</button>
+            <button type="button" data-rating="4" aria-label="4">4</button>
+            <button type="button" data-rating="5" aria-label="5, excellent">5</button>
+            <span class="hint">1 = poor · 5 = excellent</span>
+          </div>
+          <label class="field">Anything confusing, slow or wrong? <span class="hint">(optional)</span>
+            <textarea id="feedbackComment" rows="2" maxlength="1000"></textarea>
+          </label>
+          <div class="row">
+            <label class="field inline">Tester ID <input id="testerId" type="text" maxlength="40" placeholder="optional, e.g. T3"></label>
+            <button type="submit" id="feedbackSend" class="button" disabled>Send feedback</button>
+            <span id="feedbackStatus" class="hint" role="status"></span>
+          </div>
+        </form>
       </div>
     </section>
   </main>

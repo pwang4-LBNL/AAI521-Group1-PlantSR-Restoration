@@ -138,3 +138,15 @@ figcaption { font-size: 0.85rem; font-weight: 600; }
 #infoTable td { padding: 5px 0; border-bottom: 1px solid #eef1ed; }
 #infoTable tr.section th { color: var(--ink); font-weight: 650; padding-top: 12px; }
 .result-actions { display: flex; gap: 10px; }
+
+.hint.warn { color: #8a5a00; }
+optgroup { font-style: normal; color: var(--muted); }
+.feedback { border-top: 1px solid var(--line); padding-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.feedback-title { font-size: 0.9rem; font-weight: 600; }
+.rating { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rating button {
+  width: 34px; height: 34px; border-radius: 8px; border: 1px solid var(--line); background: #fff; cursor: pointer;
+}
+.rating button.active { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+textarea { width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; font: inherit; resize: vertical; }
+.field.inline input[type="text"] { width: 140px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; }

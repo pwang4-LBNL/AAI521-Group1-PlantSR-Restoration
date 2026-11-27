@@ -10,6 +10,7 @@ competing for GPU memory; the registry keeps at most one large model loaded at a
 from __future__ import annotations
 
 import argparse
+import csv
 import io
 import sys
 import threading
@@ -57,11 +58,55 @@ def png_bytes(image: Image.Image) -> bytes:
     return buffer.getvalue()
 
 
+def clean_text(value, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+class UsageLog:
+    """Append-only CSV logs for user testing: one row per job and per feedback form (no images)."""
+
+    JOB_FIELDS = ["time_utc", "session", "tester", "job_id", "task", "method", "model_version", "source", "example_id",
+                  "input_size", "processed_size", "output_size", "queue_wait_s", "run_s", "status", "error"]
+    FEEDBACK_FIELDS = ["time_utc", "session", "tester", "job_id", "task", "method", "rating", "comment"]
+
+    def __init__(self, folder=None):
+        self.folder = Path(folder) if folder else None
+        self.lock = threading.Lock()
+
+    def _append(self, name: str, fields: list[str], row: dict) -> None:
+        if self.folder is None:
+            return
+        self.folder.mkdir(parents=True, exist_ok=True)
+        path = self.folder / name
+        with self.lock:
+            new = not path.exists()
+            with path.open("a", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+                if new:
+                    writer.writeheader()
+                writer.writerow({**row, "time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+
+    def job(self, job: dict) -> None:
+        r = job.get("result") or {}
+        size = lambda v: "x".join(map(str, v)) if v else ""  # noqa: E731
+        self._append("jobs.csv", self.JOB_FIELDS, {
+            **{k: job.get(k, "") for k in ("session", "tester", "task", "method", "source", "example_id")},
+            "job_id": job["id"], "model_version": r.get("model_version", ""),
+            "input_size": size(r.get("input_size")), "processed_size": size(r.get("processed_size")),
+            "output_size": size(r.get("output_size")),
+            "queue_wait_s": round((job.get("started_at") or 0) - job["created_at"], 3) if job.get("started_at") else "",
+            "run_s": r.get("elapsed_seconds", ""), "status": job["status"], "error": job.get("error") or ""})
+
+    def feedback(self, row: dict) -> None:
+        self._append("feedback.csv", self.FEEDBACK_FIELDS, row)
+
+
 class JobQueue:
     """Single GPU worker; jobs and results are kept in memory only."""
 
-    def __init__(self, registry: Registry, examples=None):
+    def __init__(self, registry: Registry, examples=None, log: UsageLog | None = None):
         self.registry, self.examples = registry, examples
+        self.log = log or UsageLog()
         self.jobs: OrderedDict[str, dict] = OrderedDict()
         self.order: list[str] = []
         self.lock = threading.Lock()
@@ -114,6 +159,10 @@ class JobQueue:
             job["error"] = result.error
             job["status"] = "done" if result.success else "error"
             job["finished_at"] = time.time()
+            try:
+                self.log.job(job)
+            except OSError:
+                pass  # logging must never break a request
 
 
 def public(job: dict, queue: JobQueue) -> dict:
@@ -124,10 +173,11 @@ def public(job: dict, queue: JobQueue) -> dict:
     return data
 
 
-def create_app(registry: Registry, examples=None, max_upload_mb: int = 25) -> Flask:
+def create_app(registry: Registry, examples=None, max_upload_mb: int = 25, log_dir=None) -> Flask:
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["MAX_CONTENT_LENGTH"] = max_upload_mb * 1024 * 1024
-    queue = JobQueue(registry, examples)
+    usage = UsageLog(log_dir)
+    queue = JobQueue(registry, examples, usage)
     app.extensions["plantsr_queue"] = queue
 
     @app.get("/")
@@ -146,8 +196,11 @@ def create_app(registry: Registry, examples=None, max_upload_mb: int = 25) -> Fl
                             gpu_memory_allocated_gb=round(torch.cuda.memory_allocated() / 1024 ** 3, 2))
         except ImportError:
             pass
-        info["loaded_models"] = [f"{t['task']}/{m['method']}" for t in registry.describe()
-                                 for m in t["methods"] if m["uses_gpu"] and m["loaded"]]
+        tasks = registry.describe()
+        info["loaded_models"] = [f"{t['task']}/{m['method']}" for t in tasks for m in t["methods"]
+                                 if m["uses_gpu"] and m["loaded"]]
+        info["default_models"] = {t["task"]: t["default_method"] for t in tasks}
+        info["unavailable"] = registry.unavailable
         return jsonify(info)
 
     @app.get("/api/tasks")
@@ -187,7 +240,8 @@ def create_app(registry: Registry, examples=None, max_upload_mb: int = 25) -> Fl
                 seed = int(form.get("seed", 42))
             except ValueError as exc:
                 raise ValueError("The seed must be a whole number.") from exc
-            job = {"task": task, "method": handler.method, "seed": seed, "source": form.get("source", "upload")}
+            job = {"task": task, "method": handler.method, "seed": seed, "source": form.get("source", "upload"),
+                   "session": clean_text(form.get("session"), 40), "tester": clean_text(form.get("tester"), 40)}
             if job["source"] == "example":
                 if examples is None:
                     raise ValueError("Benchmark examples are not available on this server.")
@@ -227,11 +281,41 @@ def create_app(registry: Registry, examples=None, max_upload_mb: int = 25) -> Fl
         return send_file(io.BytesIO(job["_png"]), mimetype="image/png",
                          as_attachment=request.args.get("download") == "1", download_name=name)
 
+    @app.post("/api/feedback")
+    def feedback():
+        data = request.get_json(silent=True) or {}
+        job = queue.jobs.get(str(data.get("job_id", "")))
+        if job is None:
+            return jsonify(error="Unknown or expired job."), 404
+        try:
+            rating = int(data.get("rating", 0))
+        except (TypeError, ValueError):
+            rating = 0
+        if not 1 <= rating <= 5:
+            return jsonify(error="Choose a rating from 1 to 5."), 400
+        usage.feedback({"session": clean_text(data.get("session") or job.get("session"), 40),
+                        "tester": clean_text(data.get("tester") or job.get("tester"), 40),
+                        "job_id": job["id"], "task": job["task"], "method": job["method"], "rating": rating,
+                        "comment": clean_text(data.get("comment"), 1000)})
+        return jsonify(ok=True), 201
+
     @app.errorhandler(413)
     def too_large(_):
         return jsonify(error=f"Upload is larger than {max_upload_mb} MB."), 413
 
     return app
+
+
+def model_summary(registry: Registry) -> str:
+    lines = ["Models available in this app:"]
+    for task in registry.describe():
+        for m in task["methods"]:
+            star = "*" if m["method"] == task["default_method"] else " "
+            lines.append(f"  {star} {task['task']:17s} {m['method']:22s} {m['kind']:10s} {m['label']}")
+        for u in task["unavailable"]:
+            lines.append(f"  ! {task['task']:17s} {u['method']:22s} missing    {u['reason']}")
+    lines.append("  (* = default; ! = not installed, the task falls back to the next method)")
+    return "\n".join(lines)
 
 
 def main(argv=None) -> None:
@@ -243,16 +327,26 @@ def main(argv=None) -> None:
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--prepared-dir", help="PlantSR prepared/ folder for benchmark examples")
     parser.add_argument("--inpaint-manifest", help="Fixed inpainting manifest (val) for example masks")
-    parser.add_argument("--no-diffusion", action="store_true", help="Baselines only (no GPU models)")
+    parser.add_argument("--no-diffusion", action="store_true", help="Skip Stable Diffusion inpainting")
+    parser.add_argument("--baselines-only", action="store_true", help="Only the CPU baselines (UI work, no models)")
+    parser.add_argument("--preload", action="store_true", help="Load each task's default model at start-up")
+    parser.add_argument("--max-gpu-models", type=int, help="Override max_gpu_models from the config")
+    parser.add_argument("--log-dir", default=str(ROOT / "logs"), help="Where jobs.csv / feedback.csv are written")
     args = parser.parse_args(argv)
 
-    registry = build_registry(load_config(args.config), with_diffusion=not args.no_diffusion)
+    config = load_config(args.config)
+    if args.max_gpu_models:
+        config["max_gpu_models"] = args.max_gpu_models
+    registry = build_registry(config, with_diffusion=not args.no_diffusion, with_models=not args.baselines_only)
+    print(model_summary(registry))
+    if args.preload:
+        print("Preloading:", ", ".join(registry.preload()) or "nothing (no GPU models)")
     examples = None
     if args.prepared_dir:
         from src.data.benchmark_examples import BenchmarkExamples
 
         examples = BenchmarkExamples(args.prepared_dir, "val", args.inpaint_manifest)
-    app = create_app(registry, examples)
+    app = create_app(registry, examples, log_dir=args.log_dir)
     try:
         from waitress import serve
 

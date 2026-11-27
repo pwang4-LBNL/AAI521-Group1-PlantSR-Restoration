@@ -1,0 +1,2 @@
+tester,date,device,step,task,completed,confusing_controls,perceived_quality_1to5,perceived_wait,notes
+T1,,laptop / Chrome,1,denoising,yes | no | with help,,,"ok | slow | too slow",

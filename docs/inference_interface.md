@@ -1,6 +1,6 @@
 # Common inference interface
 
-Proposal from Week 1 (Ali) for the four restoration tasks, building on the README signature. Please comment on it in the team channel before we freeze it at the end of Week 1.
+Shared by all four tasks (agreed in Week 1). The app, the evaluation notebook and the tests all call it. Which model each method runs is listed in `docs/model_provenance.md`.
 
 ```python
 from src.inference.interface import restore
@@ -26,11 +26,24 @@ result = restore(image, task, mask=None, seed=42, method="sd15_finetuned")  # op
 | `input_size`, `processed_size`, `output_size` | `(width, height)` received, actually processed by the model, and returned |
 | `elapsed_seconds` | Wall time for the call, including model loading when it happens |
 | `success`, `error` | `False` with a readable message on failure (validation errors, GPU out-of-memory, etc.) |
-| `extra` | Optional task-specific details (inpainting adds `mask_coverage`) |
+| `extra` | Optional details: inpainting adds `mask_coverage`; `notes` explains resizing, tiling, grayscale conversion or a retry after GPU memory ran out |
 
 `result.metadata()` gives the same information as a JSON-safe dict for the app and the results CSV.
 
-## Adding your model (Peng: SR, Jinyuan: denoising/colorization)
+## Methods in the app
+
+| Task | Fine-tuned (default when installed) | Original pretrained | Baselines |
+| --- | --- | --- | --- |
+| `denoising` | `restormer_finetuned` | `restormer_pretrained` | `opencv_nlmeans` |
+| `super_resolution` | `hat_l`, `real_esrgan` | `hat_l_pretrained` | `bicubic_x4` |
+| `colorization` | `ddcolor_finetuned` | `ddcolor_pretrained` | `grayscale_rgb` |
+| `inpainting` | `sd15_finetuned` (after the full LoRA fine-tune) | `sd15_pretrained` (current default) | `opencv_telea`, `opencv_ns` |
+
+Wrappers: `src/inference/restormer_denoise.py`, `ddcolor_colorize.py` (ported from Jinyuan's notebook),
+`sr_plantsr.py` (calls Peng's exported `plantsr_sr` package unchanged) and `sd_inpaint.py`. Each handler
+reports `kind` (`finetuned`, `pretrained` or `baseline`), which the app uses to group methods.
+
+## Adding a model
 
 Write one small subclass of `TaskHandler` per method and register it in `src/inference/factory.py`:
 

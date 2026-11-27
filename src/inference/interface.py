@@ -68,9 +68,11 @@ class TaskHandler:
     uses_gpu: bool = False
     needs_mask: bool = False
     generative: bool = False  # True when the seed changes the output
+    kind: str = "baseline"  # "baseline", "pretrained" or "finetuned" (shown in the app)
 
     def __init__(self):
         self._loaded = not self.uses_gpu
+        self.notes: list[str] = []  # optional user-facing notes set by `run` (e.g. "input was reduced")
 
     @property
     def loaded(self) -> bool:
@@ -88,7 +90,7 @@ class TaskHandler:
 
     def describe(self) -> dict:
         return {"method": self.method, "label": self.label or self.method, "version": self.version,
-                "description": self.description, "uses_gpu": self.uses_gpu,
+                "description": self.description, "uses_gpu": self.uses_gpu, "kind": self.kind,
                 "generative": self.generative, "loaded": self.loaded}
 
 
@@ -141,6 +143,10 @@ class Registry:
         self._defaults: dict[str, str] = {}
         self._lock = threading.RLock()
         self._last_used: dict[tuple[str, str], float] = {}
+        self.unavailable: list[dict] = []  # methods skipped at start-up, with the reason
+
+    def mark_unavailable(self, task: str, method: str, reason: str) -> None:
+        self.unavailable.append({"task": task, "method": method, "reason": reason})
 
     # ------------------------------------------------------------------ registration
     def register(self, handler: TaskHandler, default: bool = False) -> TaskHandler:
@@ -172,7 +178,25 @@ class Registry:
             "needs_mask": any(h.needs_mask for h in self._handlers[task].values()),
             "default_method": self._defaults.get(task),
             "methods": [h.describe() for h in self._handlers[task].values()],
+            "unavailable": [u for u in self.unavailable if u["task"] == task],
         } for task in TASKS]
+
+    def gpu_handlers(self) -> list[TaskHandler]:
+        return [h for methods in self._handlers.values() for h in methods.values() if h.uses_gpu]
+
+    def preload(self, tasks=TASKS) -> list[str]:
+        """Load each task's default GPU method (up to `max_gpu_models`); return what was loaded."""
+        loaded = []
+        with self._lock:
+            for task in tasks:
+                if not self._handlers[task]:
+                    continue
+                handler = self.handler(task)
+                if handler.uses_gpu and len(loaded) < self.max_gpu_models:
+                    self._ensure_loaded(handler)
+                    self._last_used[(task, handler.method)] = time.time()
+                    loaded.append(f"{task}/{handler.method}")
+        return loaded
 
     # ------------------------------------------------------------------ GPU memory
     def _ensure_loaded(self, target: TaskHandler) -> None:
@@ -213,17 +237,30 @@ class Registry:
                     raise ValueError("The mask is empty. Paint or upload the area to fill (white = missing).")
                 if mask_arr.all():
                     raise ValueError("The mask covers the whole image; leave some context visible.")
+            notes = []
             with self._lock:
-                self._ensure_loaded(handler)
-                self._last_used[(handler.task, handler.method)] = time.time()
-                output, processed = handler.run(pil, mask_arr, int(seed))
+                try:
+                    output, processed = self._run(handler, pil, mask_arr, int(seed))
+                except Exception as exc:  # noqa: BLE001
+                    if not is_out_of_memory(exc) or not handler.uses_gpu:
+                        raise
+                    # Free every other model and try once more before giving up.
+                    for other in self.gpu_handlers():
+                        if other is not handler and other.loaded:
+                            other.unload()
+                    free_gpu_memory()
+                    notes.append("Other models were unloaded to free GPU memory for this request.")
+                    output, processed = self._run(handler, pil, mask_arr, int(seed))
             output = normalize_image(output)
             extra = {"mask_coverage": round(float(mask_arr.mean()), 5)} if mask_arr is not None else {}
+            notes += list(getattr(handler, "notes", []) or [])
+            if notes:
+                extra["notes"] = notes
             return RestoreResult(output, task, handler.method, handler.version, input_size,
                                  tuple(processed), output.size, time.perf_counter() - start, True, None, extra)
         except Exception as exc:  # noqa: BLE001 - report every failure to the caller
             message = str(exc) if isinstance(exc, ValueError) else f"{type(exc).__name__}: {exc}"
-            if "out of memory" in str(exc).lower():
+            if is_out_of_memory(exc):
                 message = "GPU out of memory. Try a smaller image or retry after other jobs finish. " + message
                 if handler is not None and handler.uses_gpu:
                     handler.unload()
@@ -231,6 +268,17 @@ class Registry:
             return RestoreResult(None, task, getattr(handler, "method", method or ""),
                                  getattr(handler, "version", ""), input_size, (0, 0), (0, 0),
                                  time.perf_counter() - start, False, message)
+
+
+    def _run(self, handler: TaskHandler, pil, mask_arr, seed: int):
+        self._ensure_loaded(handler)
+        self._last_used[(handler.task, handler.method)] = time.time()
+        handler.notes = []
+        return handler.run(pil, mask_arr, seed)
+
+
+def is_out_of_memory(exc: BaseException) -> bool:
+    return "out of memory" in str(exc).lower() or type(exc).__name__ == "OutOfMemoryError"
 
 
 def free_gpu_memory() -> None:

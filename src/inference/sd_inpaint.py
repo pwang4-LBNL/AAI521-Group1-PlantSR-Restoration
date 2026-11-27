@@ -118,6 +118,7 @@ class StableDiffusionInpaint(TaskHandler):
         self.steps = steps
         self.guidance = guidance
         self.pipe = pipe
+        self.kind = "finetuned" if lora_path else "pretrained"
         self.label = label or ("SD 1.5 inpainting + PlantSR LoRA" if lora_path else "SD 1.5 inpainting (pretrained)")
         self.description = (f"Latent diffusion inpainting at {work_res}px working resolution, "
                             f"{steps} steps, guidance {guidance}. Visible pixels are kept exactly.")

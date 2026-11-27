@@ -7,7 +7,9 @@ const TASK_HINTS = {
   colorization: "Color a grayscale photo",
   inpainting: "Fill missing regions",
 };
+const KIND_LABELS = { finetuned: "Fine-tuned on PlantSR", pretrained: "Original pretrained", baseline: "Simple baselines" };
 const METRIC_LABELS = {
+  delta_e00: ["Colour error ΔE00 (lower is better)", (v) => v.toFixed(2)],
   masked_psnr: ["Missing-region PSNR", (v) => `${v.toFixed(2)} dB`],
   masked_ssim: ["Missing-region SSIM", (v) => v.toFixed(4)],
   boundary_l1: ["Boundary L1 (lower is better)", (v) => v.toFixed(4)],
@@ -19,7 +21,17 @@ const state = {
   tasks: [], task: null, source: "upload", file: null, exampleId: null, examples: [],
   loaded: false, tool: "brush", drawing: false, last: null, maskLocked: false,
   coverage: 0, busy: false, jobId: null, pollTimer: null, submitted: null,
+  session: (window.crypto && crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2)).slice(0, 12),
+  rating: 0,
 };
+
+function storage(key, value) {  // localStorage can be unavailable; never let it break the page
+  try {
+    if (value === undefined) return window.localStorage.getItem(key) || "";
+    window.localStorage.setItem(key, value);
+  } catch (err) { /* ignore */ }
+  return value || "";
+}
 
 const imageCanvas = $("imageCanvas");
 const maskCanvas = $("maskCanvas");
@@ -87,14 +99,25 @@ function selectTask(name) {
   });
   const select = $("methodSelect");
   select.textContent = "";
-  for (const m of task.methods) {
-    const option = document.createElement("option");
-    option.value = m.method;
-    option.textContent = m.label + (m.method === task.default_method ? " (default)" : "");
-    select.appendChild(option);
+  for (const kind of ["finetuned", "pretrained", "baseline"]) {
+    const methods = task.methods.filter((m) => (m.kind || "baseline") === kind);
+    if (!methods.length) continue;
+    const group = document.createElement("optgroup");
+    group.label = KIND_LABELS[kind];
+    for (const m of methods) {
+      const option = document.createElement("option");
+      option.value = m.method;
+      option.textContent = m.label + (m.method === task.default_method ? " (default)" : "");
+      group.appendChild(option);
+    }
+    select.appendChild(group);
   }
   select.value = task.default_method;
   selectMethod();
+  const missing = task.unavailable || [];
+  $("methodMissing").hidden = !missing.length;
+  $("methodMissing").textContent = missing.length
+    ? `Not installed on this server: ${missing.map((u) => u.method).join(", ")}.` : "";
   $("maskTools").hidden = !task.needs_mask;
   maskCanvas.hidden = !task.needs_mask || !state.loaded;
   if (state.source === "example" && state.exampleId) loadExample(state.exampleId);
@@ -379,6 +402,8 @@ async function runJob() {
   form.append("method", $("methodSelect").value);
   form.append("seed", $("seedInput").value || "42");
   form.append("source", state.source);
+  form.append("session", state.session);
+  form.append("tester", $("testerId").value.trim());
   if (state.source === "example") {
     form.append("example_id", state.exampleId);
   } else {
@@ -414,6 +439,7 @@ async function poll() {
       setStatus(`Processing… ${seconds}s`, "", true);
     }
     if (job.status === "done" || job.status === "error") {
+      refreshHealth();  // update the queue count and loaded models right away
       setBusy(false);
       return finish(job);
     }
@@ -457,6 +483,7 @@ function finish(job) {
   ];
   if (method && method.generative) rows.push(["Seed", String(job.seed)]);
   if (r.mask_coverage !== undefined) rows.push(["Mask coverage", `${(r.mask_coverage * 100).toFixed(2)}%`]);
+  (r.notes || []).forEach((note) => rows.push(["Note", note]));
   const table = $("infoTable");
   table.textContent = "";
   const addRow = (label, value, cls) => {
@@ -480,6 +507,35 @@ function finish(job) {
   download.href = `${job.output_url}?download=1`;
   download.setAttribute("download", `plantsr_${job.task}_${job.method}_${job.id}.png`);
   $("resultBox").hidden = false;
+  resetFeedback();
+}
+
+// ---------------------------------------------------------------- user-testing feedback
+function resetFeedback() {
+  state.rating = 0;
+  document.querySelectorAll("[data-rating]").forEach((b) => b.classList.remove("active"));
+  $("feedbackComment").value = "";
+  $("feedbackSend").disabled = true;
+  $("feedbackStatus").textContent = "";
+  $("feedbackForm").hidden = false;
+}
+
+async function sendFeedback(event) {
+  event.preventDefault();
+  if (!state.rating || !state.jobId) return;
+  $("feedbackSend").disabled = true;
+  try {
+    await api("api/feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: state.jobId, rating: state.rating, comment: $("feedbackComment").value,
+        tester: $("testerId").value.trim(), session: state.session }),
+    });
+    $("feedbackStatus").textContent = "Thanks, your feedback was saved.";
+  } catch (err) {
+    $("feedbackStatus").textContent = err.message;
+    $("feedbackSend").disabled = false;
+  }
 }
 
 // ---------------------------------------------------------------- server status
@@ -490,7 +546,9 @@ async function refreshHealth() {
     pill.classList.remove("offline");
     const where = h.gpu ? `GPU · ${h.gpu}` : "CPU";
     pill.textContent = `${where} · ${h.pending_jobs} in queue`;
-    pill.title = h.loaded_models.length ? `Loaded: ${h.loaded_models.join(", ")}` : "No large model loaded";
+    const missing = (h.unavailable || []).map((u) => `${u.task}/${u.method}`);
+    pill.title = (h.loaded_models.length ? `Loaded: ${h.loaded_models.join(", ")}` : "No large model loaded")
+      + (missing.length ? `\nNot installed: ${missing.join(", ")}` : "");
   } catch (err) {
     pill.classList.add("offline");
     pill.textContent = "Server offline";
@@ -534,6 +592,17 @@ async function init() {
   $("methodSelect").addEventListener("change", selectMethod);
   $("exampleSelect").addEventListener("change", (e) => loadExample(e.target.value));
   $("runBtn").addEventListener("click", runJob);
+  document.querySelectorAll("[data-rating]").forEach((b) => b.addEventListener("click", () => {
+    state.rating = Number(b.dataset.rating);
+    document.querySelectorAll("[data-rating]").forEach((x) => x.classList.toggle("active", x === b));
+    $("feedbackSend").disabled = false;
+  }));
+  $("feedbackForm").addEventListener("submit", sendFeedback);
+  // Observers can open the app as ...?tester=T3 so every job of that tester is labelled in logs/jobs.csv.
+  const fromUrl = new URLSearchParams(window.location.search).get("tester");
+  if (fromUrl) storage("plantsr-tester", fromUrl.trim().slice(0, 40));
+  $("testerId").value = storage("plantsr-tester");
+  $("testerId").addEventListener("change", (e) => storage("plantsr-tester", e.target.value.trim()));
 
   try {
     state.tasks = await api("api/tasks");

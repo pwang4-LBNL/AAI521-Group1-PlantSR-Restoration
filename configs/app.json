@@ -1,5 +1,30 @@
 {
-  "max_gpu_models": 1,
+  "max_gpu_models": 4,
+  "include_pretrained": true,
+  "device": null,
+  "denoising": {
+    "checkpoint": "checkpoints/denoise/best.pth",
+    "sha256": "f01c68c05c056e73e0926b4f0c8ae6f497e0441970ab2552b112accd4562b040",
+    "tile": 512,
+    "halo": 32
+  },
+  "colorization": {
+    "checkpoint": "checkpoints/colorize/best.pth",
+    "sha256": "d52fcfdb9752775e1550c3820229ec189b9ee0c7481a13f3b0f6f11e08d8af0e",
+    "input_size": 512
+  },
+  "super_resolution": {
+    "package_dir": "plantsr_sr",
+    "methods": [
+      "hat_l",
+      "real_esrgan"
+    ],
+    "default": "hat_l",
+    "pretrained_methods": [
+      "hat_l"
+    ],
+    "max_input_side": 512
+  },
   "inpainting": {
     "enable_pretrained": true,
     "model_id": "stable-diffusion-v1-5/stable-diffusion-inpainting",
@@ -8,7 +33,8 @@
     "negative_prompt": "blurry, text, watermark, frame, border, cartoon, painting",
     "steps": 25,
     "guidance": 5.0,
-    "lora_path": "",
-    "default_method": ""
+    "lora_path": "checkpoints/inpaint/lora",
+    "lora_label": "",
+    "default_method": "sd15_pretrained"
   }
 }

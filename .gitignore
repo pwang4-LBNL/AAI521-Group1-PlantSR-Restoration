@@ -2,3 +2,11 @@
 __pycache__/
 logs/
 notebooks/*_output.ipynb
+
+# Model weights and app logs (see docs/deployment.md); never commit them
+checkpoints/
+plantsr_sr/weights/
+plantsr_sr/manifest.json
+*.pth
+*.pt
+*.safetensors
