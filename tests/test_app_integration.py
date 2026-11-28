@@ -1,0 +1,440 @@
+"""Checks for the integrated four-task app (CPU only; real checkpoints are used when installed).
+
+    python -m pytest -q tests/test_app_integration.py
+
+Without checkpoints the model tests are skipped and the registry/app tests still run. Super-resolution
+uses randomly initialised bundles in Peng's format (tests/helpers/fake_sr_bundle.py), so it checks the
+plumbing, not quality.
+"""
+from __future__ import annotations
+
+import csv
+import hashlib
+import io
+import json
+import re
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from app.app import create_app  # noqa: E402
+from src.inference.factory import DEFAULT_CONFIG, build_registry  # noqa: E402
+from src.inference.interface import Registry, TaskHandler  # noqa: E402
+
+RNG = np.random.default_rng(7)
+
+
+def _photo(h=96, w=128) -> np.ndarray:
+    """Smooth synthetic 'leaf' with edges, so restoration has something to recover."""
+    y, x = np.mgrid[0:h, 0:w].astype(np.float32)
+    img = np.stack([60 + 80 * np.sin(x / 9), 120 + 70 * np.cos(y / 11), 50 + 40 * np.sin((x + y) / 15)], -1)
+    img[(x - w / 2) ** 2 / (w / 3) ** 2 + (y - h / 2) ** 2 / (h / 3) ** 2 < 1] += 40
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _config(tmp_path, **overrides) -> dict:
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    cfg["include_pretrained"] = False  # never download in tests
+    cfg["device"] = "cpu"
+    cfg["denoising"]["checkpoint"] = str(tmp_path / "missing_dn.pth")
+    cfg["colorization"]["checkpoint"] = str(tmp_path / "missing_cz.pth")
+    cfg["super_resolution"]["package_dir"] = str(tmp_path / "no_sr")
+    cfg["inpainting"]["lora_path"] = str(tmp_path / "no_lora")
+    for key, value in overrides.items():
+        cfg[key].update(value) if isinstance(value, dict) else cfg.__setitem__(key, value)
+    return cfg
+
+
+def _psnr(a, b) -> float:
+    mse = np.mean((np.asarray(a, np.float64) - np.asarray(b, np.float64)) ** 2)
+    return float(10 * np.log10(255 ** 2 / mse))
+
+
+# --------------------------------------------------------------------------- registry without weights
+def test_registry_without_checkpoints_falls_back_to_baselines(tmp_path):
+    registry = build_registry(_config(tmp_path), with_diffusion=False)
+    tasks = {t["task"]: t for t in registry.describe()}
+    assert tasks["denoising"]["default_method"] == "opencv_nlmeans"
+    assert tasks["colorization"]["default_method"] == "grayscale_rgb"
+    assert tasks["super_resolution"]["default_method"] == "bicubic_x4"
+    missing = {(u["task"], u["method"]) for u in registry.unavailable}
+    assert {("denoising", "restormer_finetuned"), ("colorization", "ddcolor_finetuned"),
+            ("super_resolution", "hat_l"), ("super_resolution", "real_esrgan")} <= missing
+    assert all("not installed" in u["reason"] for u in registry.unavailable)
+
+
+def test_installed_checkpoints_become_the_defaults():
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if not (ROOT / cfg["denoising"]["checkpoint"]).is_file() or not (ROOT / cfg["colorization"]["checkpoint"]).is_file():
+        pytest.skip("Jinyuan's checkpoints are not installed (scripts/install_checkpoints.py)")
+    tasks = {t["task"]: t for t in build_registry(cfg, with_diffusion=False).describe()}
+    assert tasks["denoising"]["default_method"] == "restormer_finetuned"
+    assert tasks["colorization"]["default_method"] == "ddcolor_finetuned"
+    kinds = {m["method"]: m["kind"] for m in tasks["denoising"]["methods"]}
+    assert kinds["restormer_finetuned"] == "finetuned" and kinds["opencv_nlmeans"] == "baseline"
+
+
+# --------------------------------------------------------------------------- fixed benchmark degradations
+def test_degradations_match_the_task_owners_definitions():
+    from src.data.benchmark_examples import add_noise_fixed, bicubic_lr, jinyuan_seed
+
+    digest = hashlib.sha256(b"noise|leaf_0001|15|42").digest()
+    assert jinyuan_seed("noise", "leaf_0001", 15, 42) == int.from_bytes(digest[:8], "little") % 2**32
+    clean = _photo()
+    noisy = add_noise_fixed(clean, 15, "leaf_0001")
+    assert np.array_equal(noisy, add_noise_fixed(clean, 15, "leaf_0001")), "noise must be identical on reruns"
+    assert not np.array_equal(noisy, add_noise_fixed(clean, 15, "leaf_0002"))
+    assert 13 < float(np.std(noisy.astype(int) - clean.astype(int))) < 16
+
+    hr = Image.fromarray(clean)
+    lr = bicubic_lr(hr)
+    assert lr.size == (32, 24)
+    assert np.array_equal(np.asarray(lr), np.asarray(hr.resize((32, 24), Image.Resampling.BICUBIC, reducing_gap=None)))
+
+
+# --------------------------------------------------------------------------- real models (if installed)
+def _real_registry():
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    cfg["include_pretrained"], cfg["device"] = False, "cpu"
+    return build_registry(cfg, with_diffusion=False), cfg
+
+
+def test_restormer_denoises_and_tiles_without_seams():
+    registry, cfg = _real_registry()
+    if not (ROOT / cfg["denoising"]["checkpoint"]).is_file():
+        pytest.skip("denoising checkpoint not installed")
+    from src.data.benchmark_examples import add_noise_fixed
+
+    clean = _photo(96, 128)
+    noisy = add_noise_fixed(clean, 15, "t")
+    result = registry.restore(noisy, "denoising", method="restormer_finetuned")
+    assert result.success, result.error
+    assert result.output_size == (128, 96)
+    assert _psnr(clean, result.image) > _psnr(clean, noisy) + 4
+
+    handler = registry.handler("denoising", "restormer_finetuned")
+    handler.tile, handler.halo = 64, 16  # force tiling on a small image
+    tiled = registry.restore(noisy, "denoising", method="restormer_finetuned")
+    assert tiled.success and any("tiles" in n for n in tiled.extra.get("notes", []))
+    whole = handler._denoise(noisy)
+    assert np.abs(whole.astype(int) - np.asarray(tiled.image).astype(int)).mean() < 1.0
+
+
+def test_ddcolor_keeps_the_input_lightness():
+    registry, cfg = _real_registry()
+    if not (ROOT / cfg["colorization"]["checkpoint"]).is_file():
+        pytest.skip("colorization checkpoint not installed")
+    from src.inference.ddcolor_colorize import is_neutral_gray, to_gray_u8
+
+    gray = to_gray_u8(_photo(64, 80), "cpu")
+    assert is_neutral_gray(gray)
+    result = registry.restore(gray, "colorization", method="ddcolor_finetuned")
+    assert result.success, result.error
+    assert result.output_size == (80, 64) and result.processed_size == (512, 512)
+    assert not result.extra.get("notes"), "an already-gray input must not be converted again"
+    near_gray = np.clip(gray.astype(int) + RNG.integers(-2, 3, gray.shape), 0, 255).astype(np.uint8)  # e.g. a gray JPG
+    assert is_neutral_gray(near_gray) and not is_neutral_gray(_photo(64, 80))
+    regray = to_gray_u8(np.asarray(result.image), "cpu")
+    assert np.abs(regray.astype(int) - gray.astype(int)).mean() < 2.0, "colorization must keep L*"
+
+    colour = registry.restore(_photo(64, 80), "colorization", method="ddcolor_finetuned")
+    assert colour.success and any("converted" in n for n in colour.extra["notes"])
+
+
+# --------------------------------------------------------------------------- super-resolution plumbing
+@pytest.fixture(scope="module")
+def fake_sr(tmp_path_factory):
+    from tests.helpers.fake_sr_bundle import write_fake_bundles
+
+    package = tmp_path_factory.mktemp("sr") / "plantsr_sr"
+    package.mkdir()
+    for name in ("__init__.py", "models.py", "inference.py"):
+        (package / name).write_bytes((ROOT / "plantsr_sr" / name).read_bytes())
+    write_fake_bundles(package / "weights", ["real_esrgan"])
+    return package
+
+
+def test_super_resolution_through_restore(tmp_path, fake_sr):
+    cfg = _config(tmp_path, super_resolution={"package_dir": str(fake_sr), "methods": ["real_esrgan"],
+                                              "default": "real_esrgan", "max_input_side": 48})
+    registry = build_registry(cfg, with_diffusion=False)
+    task = next(t for t in registry.describe() if t["task"] == "super_resolution")
+    assert task["default_method"] == "real_esrgan"
+
+    small = registry.restore(_photo(24, 40), "super_resolution")
+    assert small.success, small.error
+    assert small.output_size == (160, 96) and small.processed_size == (40, 24)
+
+    large = registry.restore(_photo(60, 96), "super_resolution")  # longest side 96 > 48
+    assert large.success, large.error
+    assert large.processed_size == (48, 30) and large.output_size == (192, 120)
+    assert any("reduced" in n for n in large.extra["notes"])
+
+
+def test_plantsr_package_matches_pengs_notebook():
+    notebook = ROOT / "notebooks" / "PlantSR_x4_Super_Resolution_Colab_combined_final.ipynb"
+    if not notebook.is_file():
+        pytest.skip("Peng's SR notebook is not in this checkout")
+    source = "\n".join("".join(c["source"]) for c in json.loads(notebook.read_text(encoding="utf-8"))["cells"])
+    blocks = dict(re.findall(r"\(PACKAGE_DIR\s*/\s*['\"]([\w.]+\.py)['\"]\)\.write_text\(r'''(.*?)''',\s*encoding=",
+                             source, re.S))
+    assert {"models.py", "inference.py"} <= set(blocks)
+    for name in ("models.py", "inference.py"):
+        repo = (ROOT / "plantsr_sr" / name).read_text(encoding="utf-8").replace("\r\n", "\n")
+        assert repo == blocks[name], f"plantsr_sr/{name} differs from the code exported by Peng's notebook"
+
+
+# --------------------------------------------------------------------------- GPU memory recovery
+class _FakeGPU(TaskHandler):
+    uses_gpu = True
+    description = "fake"
+
+    def __init__(self, task, method, fail_times=0):
+        super().__init__()
+        self.task, self.method, self.label, self.fail_times = task, method, method, fail_times
+
+    def load(self):
+        self._loaded = True
+
+    def run(self, image, mask, seed):
+        if self.fail_times:
+            self.fail_times -= 1
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        return image, image.size
+
+
+def test_out_of_memory_unloads_other_models_and_retries_once():
+    registry = Registry(max_gpu_models=4)
+    other = registry.register(_FakeGPU("colorization", "other"), default=True)
+    flaky = registry.register(_FakeGPU("denoising", "flaky", fail_times=1), default=True)
+    image = _photo(16, 16)
+    assert registry.restore(image, "colorization").success and other.loaded
+    result = registry.restore(image, "denoising")
+    assert result.success, result.error
+    assert not other.loaded and flaky.loaded
+    assert any("unloaded" in n for n in result.extra["notes"])
+
+    hopeless = registry.register(_FakeGPU("super_resolution", "hopeless", fail_times=5), default=True)
+    failed = registry.restore(image, "super_resolution")
+    assert not failed.success and "GPU out of memory" in failed.error and not hopeless.loaded
+
+
+def test_gpu_model_limit_evicts_the_least_recently_used():
+    registry = Registry(max_gpu_models=2)
+    a, b, c = (registry.register(_FakeGPU(t, t[:3]), default=True)
+               for t in ("denoising", "colorization", "super_resolution"))
+    image = _photo(16, 16)
+    for task in ("denoising", "colorization", "super_resolution"):
+        assert registry.restore(image, task).success
+    assert (a.loaded, b.loaded, c.loaded) == (False, True, True)
+
+
+# --------------------------------------------------------------------------- app: logs and feedback
+def _png(arr) -> bytes:
+    buffer = io.BytesIO()
+    Image.fromarray(arr).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _wait(client, job_id, timeout=30):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = client.get(f"/api/jobs/{job_id}").get_json()
+        if job["status"] in ("done", "error"):
+            return job
+        time.sleep(0.05)
+    raise TimeoutError(job_id)
+
+
+def test_jobs_and_feedback_are_logged_for_user_testing(tmp_path):
+    client = create_app(build_registry(with_models=False), log_dir=tmp_path / "logs").test_client()
+    health = client.get("/api/health").get_json()
+    assert "unavailable" in health and "default_models" in health
+
+    job = client.post("/api/jobs", content_type="multipart/form-data", data={
+        "task": "denoising", "source": "upload", "session": "s1", "tester": "T1",
+        "image": (io.BytesIO(_png(_photo(32, 32))), "a.png")}).get_json()
+    done = _wait(client, job["id"])
+    assert done["status"] == "done"
+
+    assert client.post("/api/feedback", json={"job_id": job["id"], "rating": 9}).status_code == 400
+    assert client.post("/api/feedback", json={"job_id": "nope", "rating": 3}).status_code == 404
+    sent = client.post("/api/feedback", json={"job_id": job["id"], "rating": 4, "comment": "Mask brush\nwas small",
+                                              "session": "s1", "tester": "T1"})
+    assert sent.status_code == 201
+
+    jobs = list(csv.DictReader((tmp_path / "logs" / "jobs.csv").open(encoding="utf-8")))
+    feedback = list(csv.DictReader((tmp_path / "logs" / "feedback.csv").open(encoding="utf-8")))
+    assert jobs[0]["job_id"] == job["id"] and jobs[0]["tester"] == "T1" and jobs[0]["status"] == "done"
+    assert jobs[0]["input_size"] == "32x32" and float(jobs[0]["run_s"]) >= 0
+    assert feedback[0]["rating"] == "4" and feedback[0]["comment"] == "Mask brush was small"
+    assert feedback[0]["task"] == "denoising"
+
+
+def test_logging_is_off_without_a_log_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    client = create_app(build_registry(with_models=False)).test_client()
+    job = client.post("/api/jobs", content_type="multipart/form-data", data={
+        "task": "colorization", "source": "upload", "image": (io.BytesIO(_png(_photo(16, 16))), "a.png")}).get_json()
+    _wait(client, job["id"])
+    assert not list(tmp_path.rglob("*.csv"))
+
+
+# --------------------------------------------------------------------------- pipelines
+def _pipeline(client, steps, image, mask=None, **extra):
+    data = {"task": "pipeline", "steps": json.dumps(steps), "source": "upload", "session": "s", "tester": "T2",
+            "image": (io.BytesIO(_png(image)), "photo.png"), **extra}
+    if mask is not None:
+        data["mask"] = (io.BytesIO(_png(mask)), "mask.png")
+    return client.post("/api/jobs", content_type="multipart/form-data", data=data)
+
+
+def test_pipeline_runs_steps_in_order_and_keeps_each_result(tmp_path):
+    client = create_app(build_registry(with_models=False), log_dir=tmp_path).test_client()
+    photo = _photo(40, 48)
+    mask = np.zeros((40, 48), np.uint8)
+    mask[10:20, 12:30] = 255
+    steps = [{"task": "denoising"}, {"task": "colorization"}, {"task": "inpainting", "method": "opencv_telea"}]
+    reply = _pipeline(client, steps, photo, mask)
+    assert reply.status_code == 202, reply.get_json()
+    job = _wait(client, reply.get_json()["id"])
+    assert job["status"] == "done", job["error"]
+    assert [s["task"] for s in job["result"]["steps"]] == ["denoising", "colorization", "inpainting"]
+    assert job["method"] == "denoising:opencv_nlmeans > colorization:grayscale_rgb > inpainting:opencv_telea"
+    assert len(job["step_urls"]) == 3
+
+    after_color = np.asarray(Image.open(io.BytesIO(client.get("/" + job["step_urls"][1]).data)).convert("RGB"))
+    final = np.asarray(Image.open(io.BytesIO(client.get("/" + job["output_url"]).data)).convert("RGB"))
+    assert np.array_equal(after_color[mask == 0], final[mask == 0]), "inpainting must only change the masked area"
+    assert np.array_equal(final, np.asarray(Image.open(io.BytesIO(client.get("/" + job["step_urls"][2]).data))))
+
+    row = next(csv.DictReader((tmp_path / "jobs.csv").open(encoding="utf-8")))
+    assert row["task"] == "pipeline" and row["status"] == "done" and row["output_size"] == "48x40"
+
+
+def test_pipeline_order_matters_and_mask_follows_super_resolution(tmp_path):
+    client = create_app(build_registry(with_models=False)).test_client()
+    photo = _photo(24, 32)
+    mask = np.zeros((24, 32), np.uint8)
+    mask[4:10, 6:16] = 255
+    steps = [{"task": "super_resolution"}, {"task": "inpainting", "method": "opencv_telea"}]
+    job = _wait(client, _pipeline(client, steps, photo, mask).get_json()["id"])
+    assert job["status"] == "done", job["error"]
+    assert job["result"]["output_size"] == [128, 96]
+    assert any("mask was resized to 128×96" in n for n in job["result"]["notes"])
+    upscaled = np.asarray(Image.open(io.BytesIO(client.get("/" + job["step_urls"][0]).data)).convert("RGB"))
+    final = np.asarray(Image.open(io.BytesIO(client.get("/" + job["output_url"]).data)).convert("RGB"))
+    big_mask = np.kron(mask > 0, np.ones((4, 4), bool))
+    assert np.array_equal(upscaled[~big_mask], final[~big_mask])
+
+    reverse = _wait(client, _pipeline(client, steps[::-1], photo, mask).get_json()["id"])
+    assert reverse["status"] == "done" and not reverse["result"]["notes"]
+    assert reverse["result"]["steps"][0]["output_size"] == [32, 24]
+
+
+def test_pipeline_requests_are_validated():
+    client = create_app(build_registry(with_models=False)).test_client()
+    photo = _photo(16, 16)
+    cases = [
+        ([], "at least one step"),
+        ([{"task": "denoising"}, {"task": "denoising"}], "twice"),
+        ([{"task": "sharpening"}], "Unknown pipeline step"),
+        ([{"task": "inpainting"}], "mask"),
+        ([{"task": "denoising", "method": "nope"}], ""),
+    ]
+    for steps, message in cases:
+        reply = _pipeline(client, steps, photo)
+        assert reply.status_code == 400, steps
+        assert message in reply.get_json()["error"]
+    example = _pipeline(client, [{"task": "denoising"}], photo, source="example")
+    assert example.status_code == 400 and "benchmark" in example.get_json()["error"].lower()
+
+
+class _Broken(TaskHandler):
+    task, method, label, description = "colorization", "broken", "broken", "always fails"
+
+    def run(self, image, mask, seed):
+        raise ValueError("boom")
+
+
+def test_pipeline_stops_at_a_failing_step_and_keeps_earlier_results():
+    registry = build_registry(with_models=False)
+    registry.register(_Broken())
+    client = create_app(registry).test_client()
+    steps = [{"task": "denoising"}, {"task": "colorization", "method": "broken"}, {"task": "super_resolution"}]
+    job = _wait(client, _pipeline(client, steps, _photo(16, 16)).get_json()["id"])
+    assert job["status"] == "error" and job["error"].startswith("Step 2 (colorization) failed")
+    assert len(job["step_urls"]) == 1 and len(job["result"]["steps"]) == 2
+    assert client.get("/" + job["step_urls"][0]).status_code == 200
+    assert client.get(f"/api/jobs/{job['id']}/output.png").status_code == 404
+
+
+# --------------------------------------------------------------------------- inpainting fine-tuning (C2)
+def test_c2_training_helpers(tmp_path):
+    from src.train.inpaint_lora import export_lora, list_checkpoints, warmup_factor
+
+    assert [round(warmup_factor(i, 4), 2) for i in range(6)] == [0.25, 0.5, 0.75, 1.0, 1.0, 1.0]
+    assert warmup_factor(0, 0) == 1.0
+    for step in (500, 250, 1000):
+        folder = tmp_path / f"step_{step:05d}"
+        folder.mkdir()
+        (folder / "pytorch_lora_weights.safetensors").write_bytes(b"x" * step)
+        (folder / "trial_config.json").write_text(json.dumps({"step": step}))
+    (tmp_path / "step_00750").mkdir()  # incomplete checkpoint (no weights) is ignored
+    assert [s for s, _ in list_checkpoints(tmp_path)] == [250, 500, 1000]
+    dest = export_lora(tmp_path / "step_00500", tmp_path / "lora_best", {"selection": {"step": 500}})
+    assert dest.stat().st_size == 500
+    record = json.loads((tmp_path / "lora_best" / "trial_config.json").read_text())
+    assert record == {"step": 500, "selection": {"step": 500}}
+
+
+def test_c2_evaluation_helpers():
+    from src.evaluation.inpaint_eval import paired, stratified_ids, summary
+
+    class Examples:
+        mask_info = {f"s{i}": {"mask_type": "rectangle" if i % 2 else "freeform", "mask_coverage": 0.05 + 0.01 * i}
+                     for i in range(10)}
+
+        def ids(self):
+            return list(self.mask_info)
+
+    picked = stratified_ids(Examples(), 4)
+    assert len(picked) == 4 and len(set(picked)) == 4
+    assert {Examples.mask_info[s]["mask_type"] for s in picked} == {"rectangle", "freeform"}
+
+    import pandas as pd
+
+    table = pd.DataFrame({"method": ["a"] * 6 + ["b"] * 6, "sample_id": [f"s{i}" for i in range(6)] * 2,
+                          "masked_bbox_lpips": [0.1] * 6 + [0.2] * 6, "masked_psnr": [20.0] * 6 + [19.0] * 6})
+    compared = paired(table, "a", "b").set_index("metric")
+    assert compared.loc["masked_bbox_lpips", "a_better_share"] == 1.0  # lower LPIPS is better
+    assert compared.loc["masked_psnr", "a_better_share"] == 1.0        # higher PSNR is better
+    assert summary(table).loc["a", "crops"] == 6
+
+
+def test_finetuned_inpainting_becomes_default_when_installed(tmp_path):
+    cfg = _config(tmp_path)
+    cfg["inpainting"]["model_id"] = "not/downloaded"  # handlers load lazily; nothing is fetched here
+    assert DEFAULT_CONFIG["inpainting"]["default_method"] == "sd15_finetuned"
+    without = {t["task"]: t for t in build_registry(cfg).describe()}["inpainting"]
+    assert without["default_method"] == "sd15_pretrained"
+    assert any(u["method"] == "sd15_finetuned" for u in without["unavailable"])
+    lora = tmp_path / "lora"
+    lora.mkdir()
+    (lora / "pytorch_lora_weights.safetensors").write_bytes(b"0")
+    cfg["inpainting"]["lora_path"] = str(lora)
+    task = {t["task"]: t for t in build_registry(cfg).describe()}["inpainting"]
+    assert task["default_method"] == "sd15_finetuned" and not task["unavailable"]
+    label = next(m["label"] for m in task["methods"] if m["method"] == "sd15_finetuned")
+    assert label == "SD 1.5 inpainting · fine-tuned on PlantSR"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

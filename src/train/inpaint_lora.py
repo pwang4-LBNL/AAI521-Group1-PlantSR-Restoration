@@ -9,14 +9,21 @@ flip -> random mask (5-20%, rectangle or free-form) drawn *after* the geometry, 
 and mask are aligned by construction -> both resized to the working resolution
 (bicubic image, nearest mask). Loss: standard epsilon-prediction MSE on the 9-channel UNet.
 
+Week 2 (task C2) uses `train_lora` for the full run: the same sample pipeline and loss, a batch of
+several crops, learning-rate warm-up, a checkpoint every N steps, a CSV training log and automatic
+resume from the last checkpoint (Colab sessions can disconnect). The checkpoint with the best
+validation score is selected afterwards in notebooks/PlantSR_Inpainting_C2_Finetune.ipynb.
+
 Fresh-process reload check (run by the notebook):
     python -m src.train.inpaint_lora reload-check --lora DIR --cases cases.json --out out.npz
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import platform
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -241,6 +248,187 @@ def train_lora_trial(pipe, dataset: TrainCropDataset, cfg: LoraTrialConfig, prog
         result.peak_gpu_memory_gb = round(torch.cuda.max_memory_allocated(device) / 1024 ** 3, 2)
     del optimizer
     return result
+
+
+@dataclass
+class LoraTrainConfig(LoraTrialConfig):
+    """Full fine-tuning run (C2). Defaults fit a 16 GB T4 in about an hour."""
+
+    steps: int = 1500
+    batch_size: int = 4
+    rank: int = 16
+    alpha: int = 16
+    learning_rate: float = 1e-4
+    warmup_steps: int = 100
+    checkpoint_every: int = 250
+    log_every: int = 25
+
+
+LOG_FIELDS = ["step", "loss", "learning_rate", "grad_norm", "seconds", "time_utc"]
+CHECKPOINT_DIR = re.compile(r"^step_(\d{5})$")
+
+
+def warmup_factor(step: int, warmup_steps: int) -> float:
+    """Linear warm-up to the full learning rate, then constant (step counts from 0)."""
+    return min(1.0, (step + 1) / warmup_steps) if warmup_steps > 0 else 1.0
+
+
+def list_checkpoints(out_dir) -> list[tuple[int, Path]]:
+    """[(step, folder)] for every saved checkpoint, oldest first."""
+    out_dir = Path(out_dir)
+    found = []
+    for path in out_dir.glob("step_*") if out_dir.is_dir() else []:
+        match = CHECKPOINT_DIR.match(path.name)
+        if match and (path / "pytorch_lora_weights.safetensors").is_file():
+            found.append((int(match.group(1)), path))
+    return sorted(found)
+
+
+def _append_log(path: Path, rows: list[dict]) -> None:
+    new = not path.exists()
+    with path.open("a", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=LOG_FIELDS)
+        if new:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def train_lora(pipe, dataset: TrainCropDataset, cfg: LoraTrainConfig, out_dir, progress=print,
+               inference: dict | None = None) -> dict:
+    """Full LoRA fine-tuning with checkpoints every `cfg.checkpoint_every` steps and automatic resume.
+
+    Writes out_dir/step_NNNNN/ (adapter + trial_config.json), out_dir/train_state.pt (optimizer, scaler,
+    step and adapter weights of the latest checkpoint) and out_dir/train_log.csv. Calling it again with the
+    same out_dir continues after the last checkpoint; a finished run returns immediately.
+    """
+    import torch
+    import torch.nn.functional as F
+    from diffusers import DDPMScheduler
+    from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    state_path, log_path = out_dir / "train_state.pt", out_dir / "train_log.csv"
+    device = pipe.unet.device
+    torch.manual_seed(cfg.seed)
+    unet, vae = pipe.unet, pipe.vae
+    vae.requires_grad_(False)
+    pipe.text_encoder.requires_grad_(False)
+    params = add_lora(unet, cfg)
+    optimizer = torch.optim.AdamW(params, lr=cfg.learning_rate, weight_decay=1e-2)
+    schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda i: warmup_factor(i, cfg.warmup_steps))
+    noise_scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
+    prediction_type = noise_scheduler.config.prediction_type
+    with torch.no_grad():
+        prompt_embeds, _ = pipe.encode_prompt(cfg.prompt, device, 1, False)
+    use_amp = device.type == "cuda"
+    amp_dtype = torch.float32
+    if use_amp:
+        amp_dtype = torch.bfloat16 if torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
+        torch.cuda.reset_peak_memory_stats(device)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
+
+    start_step = 0
+    if state_path.is_file():
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        if state.get("config", {}).get("rank") != cfg.rank:
+            raise ValueError(f"{state_path} was trained with a different LoRA rank; use a new output folder.")
+        set_peft_model_state_dict(unet, {k: v.to(device) for k, v in state["adapter"].items()})
+        optimizer.load_state_dict(state["optimizer"])
+        schedule.load_state_dict(state["schedule"])
+        scaler.load_state_dict(state["scaler"])
+        start_step = int(state["step"])
+        progress(f"Resuming from step {start_step} ({state_path})")
+    if start_step >= cfg.steps:
+        progress(f"Training already finished ({start_step} steps).")
+        return {"steps": start_step, "resumed_from": start_step,
+                "checkpoints": [s for s, _ in list_checkpoints(out_dir)]}
+
+    # New random crops/masks after a resume (a fresh pass, statistically equivalent to continuing).
+    dataset.rng = np.random.default_rng(cfg.seed + start_step)
+    dataset.masks = TrainingMaskSampler(cfg.seed + 1 + start_step)
+    generator = torch.Generator().manual_seed(cfg.seed + start_step)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=0,
+                                         collate_fn=_collate, generator=generator, drop_last=True)
+    batches = epoch_batches(loader)
+    if cfg.gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
+    unet.train()
+    sf = vae.config.scaling_factor
+    pending, losses = [], []
+    for step in range(start_step + 1, cfg.steps + 1):
+        start = time.perf_counter()
+        batch = next(batches)
+        pixel = batch["pixel_values"].to(device, dtype=vae.dtype)
+        mask = batch["mask"].to(device, dtype=vae.dtype)
+        masked = pixel * (mask < 0.5)
+        with torch.no_grad():
+            latents = vae.encode(pixel).latent_dist.sample() * sf
+            masked_latents = vae.encode(masked).latent_dist.sample() * sf
+        mask_latent = F.interpolate(mask, size=latents.shape[-2:])
+        noise = torch.randn_like(latents)
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],),
+                                  device=device).long()
+        noisy = noise_scheduler.add_noise(latents, noise, timesteps)
+        model_input = torch.cat([noisy, mask_latent, masked_latents], dim=1)
+        target = noise if prediction_type == "epsilon" else noise_scheduler.get_velocity(latents, noise, timesteps)
+        with torch.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
+            pred = unet(model_input, timesteps,
+                        encoder_hidden_states=prompt_embeds.expand(latents.shape[0], -1, -1)).sample
+        loss = F.mse_loss(pred.float(), target.float())
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"Non-finite loss at step {step}; lower the learning rate.")
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
+        lr = optimizer.param_groups[0]["lr"]
+        scaler.step(optimizer)
+        scaler.update()
+        schedule.step()
+        if use_amp:
+            torch.cuda.synchronize(device)
+        losses.append(float(loss.detach()))
+        pending.append({"step": step, "loss": round(losses[-1], 6), "learning_rate": lr,
+                        "grad_norm": round(float(grad_norm), 6), "seconds": round(time.perf_counter() - start, 3),
+                        "time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+        if progress and (step % cfg.log_every == 0 or step == start_step + 1):
+            recent = float(np.mean(losses[-cfg.log_every:]))
+            progress(f"step {step:5d}/{cfg.steps}  loss {recent:.4f} (mean of last {min(len(losses), cfg.log_every)})"
+                     f"  lr {lr:.2e}  {pending[-1]['seconds']:.2f}s/step")
+        if step % cfg.checkpoint_every == 0 or step == cfg.steps:
+            _append_log(log_path, pending)
+            pending = []
+            folder = out_dir / f"step_{step:05d}"
+            save_lora(unet, folder, cfg, extra={"step": step, "inference": inference or {}})
+            torch.save({"step": step, "config": asdict(cfg), "optimizer": optimizer.state_dict(),
+                        "schedule": schedule.state_dict(), "scaler": scaler.state_dict(),
+                        "adapter": {k: v.detach().cpu() for k, v in get_peft_model_state_dict(unet).items()}},
+                       state_path.with_suffix(".tmp"))
+            state_path.with_suffix(".tmp").replace(state_path)  # never leave a half-written state file
+            progress(f"checkpoint saved: {folder.name}")
+    unet.eval()
+    if cfg.gradient_checkpointing:
+        unet.disable_gradient_checkpointing()
+    peak = round(torch.cuda.max_memory_allocated(device) / 1024 ** 3, 2) if use_amp else None
+    del optimizer
+    return {"steps": cfg.steps, "resumed_from": start_step, "peak_gpu_memory_gb": peak,
+            "checkpoints": [s for s, _ in list_checkpoints(out_dir)]}
+
+
+def export_lora(checkpoint_dir, dest, extra: dict | None = None) -> Path:
+    """Copy a selected checkpoint to `dest` (the folder the app installs) and record why it was chosen."""
+    import shutil
+
+    checkpoint_dir, dest = Path(checkpoint_dir), Path(dest)
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    shutil.copy2(checkpoint_dir / "pytorch_lora_weights.safetensors", dest / "pytorch_lora_weights.safetensors")
+    record = json.loads((checkpoint_dir / "trial_config.json").read_text(encoding="utf-8"))
+    record.update(extra or {})
+    (dest / "trial_config.json").write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
+    return dest / "pytorch_lora_weights.safetensors"
 
 
 def prepare_for_inference(unet, dtype) -> None:

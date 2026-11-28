@@ -1,0 +1,57 @@
+{
+  "commit": "635efe3 C2: inpainting LoRA fine-tuning and evaluation",
+  "gpu": "Tesla T4 \u00b7 14.6 GB \u00b7 compute capability 7.5",
+  "train": {
+    "model_id": "stable-diffusion-v1-5/stable-diffusion-inpainting",
+    "steps": 1500,
+    "learning_rate": 0.0001,
+    "rank": 16,
+    "alpha": 16,
+    "batch_size": 4,
+    "crop_size": 256,
+    "work_res": 512,
+    "prompt": "a high-resolution photo of a plant, natural leaves, sharp focus",
+    "seed": 42,
+    "gradient_checkpointing": true,
+    "max_grad_norm": 1.0,
+    "target_modules": [
+      "to_q",
+      "to_k",
+      "to_v",
+      "to_out.0"
+    ],
+    "log_every": 25,
+    "warmup_steps": 100,
+    "checkpoint_every": 250
+  },
+  "inference": {
+    "work_res": 512,
+    "prompt": "a high-resolution photo of a plant, natural leaves, sharp focus",
+    "negative_prompt": "blurry, text, watermark, frame, border, cartoon, painting",
+    "steps": 25,
+    "guidance": 5.0,
+    "model_id": "stable-diffusion-v1-5/stable-diffusion-inpainting"
+  },
+  "train_info": {
+    "steps": 1500,
+    "resumed_from": 0,
+    "peak_gpu_memory_gb": 3.59,
+    "checkpoints": [
+      250,
+      500,
+      750,
+      1000,
+      1250,
+      1500
+    ],
+    "minutes_this_session": 61.8,
+    "gpu": "Tesla T4 \u00b7 14.6 GB \u00b7 compute capability 7.5"
+  },
+  "selected_step": 250,
+  "rank_metric": "masked_bbox_lpips",
+  "selection_crops": 24,
+  "val_crops": 166,
+  "test_crops": 200,
+  "app_check": true,
+  "lora_sha256": "6fa69e75b74ed44190c7496fdd2e149f011a24d39d86abd3474efffcfe406a8d"
+}

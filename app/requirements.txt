@@ -1,13 +1,24 @@
-# Web application + inpainting inference (PyTorch is installed separately for your CUDA version)
-flask>=3.0
+# PlantSR restoration app: web server, the four task models and their metrics.
+# Install PyTorch + torchvision for your GPU first (https://pytorch.org/get-started/locally/),
+# e.g. on Windows with an RTX card:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+flask>=3.0,<4
 waitress>=3.0
-pillow>=10.0
 numpy>=1.26
+Pillow==11.3.0               # same version as the SR notebook, so benchmark bicubic inputs match exactly
 opencv-python-headless>=4.8
 scikit-image>=0.22
+huggingface_hub>=0.24
+safetensors>=0.4
+# Denoising + colorization (Jinyuan) and super-resolution (Peng): versions pinned in their notebooks
+spandrel==0.4.2
+spandrel_extra_arches==0.2.0
+kornia==0.9.1
+# Inpainting (Ali)
 diffusers>=0.32
 transformers>=4.40
 accelerate>=0.30
 peft>=0.14
-safetensors>=0.4
-lpips>=0.1.4  # optional, used for model-selection metrics only
+# Model selection / evaluation only
+lpips==0.1.4
+pytest>=8
+gdown>=5                     # used by scripts/install_checkpoints.py --download-sr

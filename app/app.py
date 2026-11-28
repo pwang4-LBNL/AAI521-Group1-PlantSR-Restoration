@@ -10,7 +10,9 @@ competing for GPU memory; the registry keeps at most one large model loaded at a
 from __future__ import annotations
 
 import argparse
+import csv
 import io
+import json
 import sys
 import threading
 import time
@@ -30,6 +32,7 @@ from src.inference.interface import TASKS, Registry, normalize_mask  # noqa: E40
 ALLOWED_FORMATS = {"JPEG", "PNG"}
 MAX_PIXELS = 40_000_000
 KEEP_JOBS = 100
+MAX_PIPELINE_STEPS = 4
 
 
 def read_upload(storage, what: str = "image") -> Image.Image:
@@ -51,17 +54,94 @@ def read_upload(storage, what: str = "image") -> Image.Image:
         raise ValueError(f"The {what} could not be read as a JPG or PNG file.") from exc
 
 
+def parse_steps(raw: str, registry: Registry) -> list[dict]:
+    """Validate a pipeline: a JSON list of {"task", "method"} run in order, each task at most once."""
+    try:
+        steps = json.loads(raw or "[]")
+    except json.JSONDecodeError as exc:
+        raise ValueError("The pipeline could not be read.") from exc
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("Add at least one step to the pipeline.")
+    if len(steps) > MAX_PIPELINE_STEPS:
+        raise ValueError(f"A pipeline can have at most {MAX_PIPELINE_STEPS} steps.")
+    clean, seen = [], set()
+    for step in steps:
+        task = step.get("task") if isinstance(step, dict) else None
+        if task not in TASKS:
+            raise ValueError(f"Unknown pipeline step: {task!r}.")
+        if task in seen:
+            raise ValueError(f"{task.replace('_', '-')} appears twice in the pipeline.")
+        seen.add(task)
+        handler = registry.handler(task, step.get("method") or None)
+        clean.append({"task": task, "method": handler.method, "needs_mask": handler.needs_mask})
+    return clean
+
+
+def resize_mask(mask, size: tuple[int, int]):
+    """Nearest-neighbour resize of a 0/1 mask, e.g. after super-resolution made the image 4x larger."""
+    import numpy as np
+
+    if mask is None or (mask.shape[1], mask.shape[0]) == tuple(size):
+        return mask
+    return (np.asarray(Image.fromarray((mask > 0).astype(np.uint8) * 255).resize(size, Image.Resampling.NEAREST))
+            > 127).astype(np.uint8)
+
+
 def png_bytes(image: Image.Image) -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
 
 
+def clean_text(value, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+class UsageLog:
+    """Append-only CSV logs for user testing: one row per job and per feedback form (no images)."""
+
+    JOB_FIELDS = ["time_utc", "session", "tester", "job_id", "task", "method", "model_version", "source", "example_id",
+                  "input_size", "processed_size", "output_size", "queue_wait_s", "run_s", "status", "error"]
+    FEEDBACK_FIELDS = ["time_utc", "session", "tester", "job_id", "task", "method", "rating", "comment"]
+
+    def __init__(self, folder=None):
+        self.folder = Path(folder) if folder else None
+        self.lock = threading.Lock()
+
+    def _append(self, name: str, fields: list[str], row: dict) -> None:
+        if self.folder is None:
+            return
+        self.folder.mkdir(parents=True, exist_ok=True)
+        path = self.folder / name
+        with self.lock:
+            new = not path.exists()
+            with path.open("a", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+                if new:
+                    writer.writeheader()
+                writer.writerow({**row, "time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+
+    def job(self, job: dict) -> None:
+        r = job.get("result") or {}
+        size = lambda v: "x".join(map(str, v)) if v else ""  # noqa: E731
+        self._append("jobs.csv", self.JOB_FIELDS, {
+            **{k: job.get(k, "") for k in ("session", "tester", "task", "method", "source", "example_id")},
+            "job_id": job["id"], "model_version": r.get("model_version", ""),
+            "input_size": size(r.get("input_size")), "processed_size": size(r.get("processed_size")),
+            "output_size": size(r.get("output_size")),
+            "queue_wait_s": round((job.get("started_at") or 0) - job["created_at"], 3) if job.get("started_at") else "",
+            "run_s": r.get("elapsed_seconds", ""), "status": job["status"], "error": job.get("error") or ""})
+
+    def feedback(self, row: dict) -> None:
+        self._append("feedback.csv", self.FEEDBACK_FIELDS, row)
+
+
 class JobQueue:
     """Single GPU worker; jobs and results are kept in memory only."""
 
-    def __init__(self, registry: Registry, examples=None):
+    def __init__(self, registry: Registry, examples=None, log: UsageLog | None = None):
         self.registry, self.examples = registry, examples
+        self.log = log or UsageLog()
         self.jobs: OrderedDict[str, dict] = OrderedDict()
         self.order: list[str] = []
         self.lock = threading.Lock()
@@ -100,6 +180,9 @@ class JobQueue:
                 if job is None:
                     continue
                 job["status"], job["started_at"] = "running", time.time()
+            if job["task"] == "pipeline":
+                self._run_pipeline(job)
+                continue
             result = self.registry.restore(job.pop("_image"), job["task"], job.pop("_mask", None),
                                            seed=job["seed"], method=job["method"])
             job["result"] = result.metadata()
@@ -113,7 +196,46 @@ class JobQueue:
                         job["metrics"] = {"note": f"metrics unavailable: {exc}"}
             job["error"] = result.error
             job["status"] = "done" if result.success else "error"
-            job["finished_at"] = time.time()
+            self._finish(job)
+
+    def _finish(self, job: dict) -> None:
+        job["finished_at"] = time.time()
+        try:
+            self.log.job(job)
+        except OSError:
+            pass  # logging must never break a request
+
+    def _run_pipeline(self, job: dict) -> None:
+        """Run the steps in order; each step gets the previous step's output. Stops at the first failure."""
+        image, mask = job.pop("_image"), job.pop("_mask", None)
+        first_size, steps, notes, total = list(image.size), [], [], 0.0
+        job["_step_png"] = []
+        for index, step in enumerate(job["steps"], start=1):
+            job["progress"] = {"step": index, "total": len(job["steps"]), "task": step["task"]}
+            step_mask = resize_mask(mask, image.size) if step["needs_mask"] else None
+            if step_mask is not None and step_mask is not mask:
+                notes.append(f"Step {index}: the mask was resized to {image.width}×{image.height} "
+                             "to match the image from the previous step.")
+            result = self.registry.restore(image, step["task"], step_mask, seed=job["seed"], method=step["method"])
+            total += result.elapsed_seconds
+            steps.append(result.metadata())
+            if not result.success:
+                job["error"] = f"Step {index} ({step['task'].replace('_', '-')}) failed: {result.error}"
+                break
+            image = result.image
+            job["_step_png"].append(png_bytes(image))
+        job["result"] = {"task": "pipeline", "method": job["method"], "steps": steps, "notes": notes,
+                         "input_size": first_size, "processed_size": [],
+                         "output_size": list(image.size) if not job["error"] else [],
+                         "elapsed_seconds": round(total, 3),
+                         "model_version": " > ".join(s.get("model_version") or s["method"] for s in steps)}
+        job.pop("progress", None)
+        if job["error"]:
+            job["status"] = "error"
+        else:
+            job["_png"] = job["_step_png"][-1]
+            job["status"] = "done"
+        self._finish(job)
 
 
 def public(job: dict, queue: JobQueue) -> dict:
@@ -121,13 +243,16 @@ def public(job: dict, queue: JobQueue) -> dict:
     data["queue_position"] = queue.position(job["id"]) if job["status"] == "queued" else 0
     if job["status"] == "done":
         data["output_url"] = f"api/jobs/{job['id']}/output.png"
+    if job.get("_step_png"):
+        data["step_urls"] = [f"api/jobs/{job['id']}/steps/{i}.png" for i in range(1, len(job["_step_png"]) + 1)]
     return data
 
 
-def create_app(registry: Registry, examples=None, max_upload_mb: int = 25) -> Flask:
+def create_app(registry: Registry, examples=None, max_upload_mb: int = 25, log_dir=None) -> Flask:
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["MAX_CONTENT_LENGTH"] = max_upload_mb * 1024 * 1024
-    queue = JobQueue(registry, examples)
+    usage = UsageLog(log_dir)
+    queue = JobQueue(registry, examples, usage)
     app.extensions["plantsr_queue"] = queue
 
     @app.get("/")
@@ -146,8 +271,11 @@ def create_app(registry: Registry, examples=None, max_upload_mb: int = 25) -> Fl
                             gpu_memory_allocated_gb=round(torch.cuda.memory_allocated() / 1024 ** 3, 2))
         except ImportError:
             pass
-        info["loaded_models"] = [f"{t['task']}/{m['method']}" for t in registry.describe()
-                                 for m in t["methods"] if m["uses_gpu"] and m["loaded"]]
+        tasks = registry.describe()
+        info["loaded_models"] = [f"{t['task']}/{m['method']}" for t in tasks for m in t["methods"]
+                                 if m["uses_gpu"] and m["loaded"]]
+        info["default_models"] = {t["task"]: t["default_method"] for t in tasks}
+        info["unavailable"] = registry.unavailable
         return jsonify(info)
 
     @app.get("/api/tasks")
@@ -179,6 +307,8 @@ def create_app(registry: Registry, examples=None, max_upload_mb: int = 25) -> Fl
     def submit():
         form = request.form
         task = form.get("task", "")
+        if task == "pipeline":
+            return submit_pipeline(form)
         try:
             if task not in TASKS:
                 raise ValueError(f"Choose a task: {', '.join(TASKS)}.")
@@ -187,7 +317,8 @@ def create_app(registry: Registry, examples=None, max_upload_mb: int = 25) -> Fl
                 seed = int(form.get("seed", 42))
             except ValueError as exc:
                 raise ValueError("The seed must be a whole number.") from exc
-            job = {"task": task, "method": handler.method, "seed": seed, "source": form.get("source", "upload")}
+            job = {"task": task, "method": handler.method, "seed": seed, "source": form.get("source", "upload"),
+                   "session": clean_text(form.get("session"), 40), "tester": clean_text(form.get("tester"), 40)}
             if job["source"] == "example":
                 if examples is None:
                     raise ValueError("Benchmark examples are not available on this server.")
@@ -211,6 +342,44 @@ def create_app(registry: Registry, examples=None, max_upload_mb: int = 25) -> Fl
         job = queue.submit(job)
         return jsonify(public(job, queue)), 202
 
+    def submit_pipeline(form):
+        try:
+            steps = parse_steps(form.get("steps"), registry)
+            if form.get("source", "upload") != "upload":
+                raise ValueError("Pipelines run on uploaded images; benchmark examples score one task at a time.")
+            try:
+                seed = int(form.get("seed", 42))
+            except ValueError as exc:
+                raise ValueError("The seed must be a whole number.") from exc
+            image = read_upload(request.files.get("image"))
+            mask = None
+            job = {"task": "pipeline", "steps": steps, "seed": seed, "source": "upload",
+                   "method": " > ".join(f"{s['task']}:{s['method']}" for s in steps),
+                   "session": clean_text(form.get("session"), 40), "tester": clean_text(form.get("tester"), 40)}
+            if any(s["needs_mask"] for s in steps):
+                if not request.files.get("mask"):
+                    raise ValueError("The pipeline includes inpainting: paint or upload a mask first.")
+                mask_image = read_upload(request.files.get("mask"), "mask")
+                if mask_image.size != image.size:
+                    job["mask_resized"] = True
+                mask = normalize_mask(mask_image, image.size)
+            job["input_size"] = list(image.size)
+            job["_image"], job["_mask"] = image, mask
+        except (ValueError, KeyError) as exc:
+            return jsonify(error=str(exc).strip("'\"")), 400
+        job = queue.submit(job)
+        return jsonify(public(job, queue)), 202
+
+    @app.get("/api/jobs/<job_id>/steps/<int:index>.png")
+    def job_step_output(job_id, index):
+        job = queue.jobs.get(job_id)
+        pngs = (job or {}).get("_step_png") or []
+        if not 1 <= index <= len(pngs):
+            return jsonify(error="No output for this step."), 404
+        name = f"plantsr_pipeline_step{index}_{job['steps'][index - 1]['task']}_{job_id}.png"
+        return send_file(io.BytesIO(pngs[index - 1]), mimetype="image/png",
+                         as_attachment=request.args.get("download") == "1", download_name=name)
+
     @app.get("/api/jobs/<job_id>")
     def job_status(job_id):
         job = queue.jobs.get(job_id)
@@ -223,15 +392,46 @@ def create_app(registry: Registry, examples=None, max_upload_mb: int = 25) -> Fl
         job = queue.jobs.get(job_id)
         if job is None or "_png" not in job:
             return jsonify(error="No output for this job."), 404
-        name = f"plantsr_{job['task']}_{job['method']}_{job_id}.png"
+        name = (f"plantsr_pipeline_{job_id}.png" if job["task"] == "pipeline"
+                else f"plantsr_{job['task']}_{job['method']}_{job_id}.png")
         return send_file(io.BytesIO(job["_png"]), mimetype="image/png",
                          as_attachment=request.args.get("download") == "1", download_name=name)
+
+    @app.post("/api/feedback")
+    def feedback():
+        data = request.get_json(silent=True) or {}
+        job = queue.jobs.get(str(data.get("job_id", "")))
+        if job is None:
+            return jsonify(error="Unknown or expired job."), 404
+        try:
+            rating = int(data.get("rating", 0))
+        except (TypeError, ValueError):
+            rating = 0
+        if not 1 <= rating <= 5:
+            return jsonify(error="Choose a rating from 1 to 5."), 400
+        usage.feedback({"session": clean_text(data.get("session") or job.get("session"), 40),
+                        "tester": clean_text(data.get("tester") or job.get("tester"), 40),
+                        "job_id": job["id"], "task": job["task"], "method": job["method"], "rating": rating,
+                        "comment": clean_text(data.get("comment"), 1000)})
+        return jsonify(ok=True), 201
 
     @app.errorhandler(413)
     def too_large(_):
         return jsonify(error=f"Upload is larger than {max_upload_mb} MB."), 413
 
     return app
+
+
+def model_summary(registry: Registry) -> str:
+    lines = ["Models available in this app:"]
+    for task in registry.describe():
+        for m in task["methods"]:
+            star = "*" if m["method"] == task["default_method"] else " "
+            lines.append(f"  {star} {task['task']:17s} {m['method']:22s} {m['kind']:10s} {m['label']}")
+        for u in task["unavailable"]:
+            lines.append(f"  ! {task['task']:17s} {u['method']:22s} missing    {u['reason']}")
+    lines.append("  (* = default; ! = not installed, the task falls back to the next method)")
+    return "\n".join(lines)
 
 
 def main(argv=None) -> None:
@@ -243,16 +443,26 @@ def main(argv=None) -> None:
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--prepared-dir", help="PlantSR prepared/ folder for benchmark examples")
     parser.add_argument("--inpaint-manifest", help="Fixed inpainting manifest (val) for example masks")
-    parser.add_argument("--no-diffusion", action="store_true", help="Baselines only (no GPU models)")
+    parser.add_argument("--no-diffusion", action="store_true", help="Skip Stable Diffusion inpainting")
+    parser.add_argument("--baselines-only", action="store_true", help="Only the CPU baselines (UI work, no models)")
+    parser.add_argument("--preload", action="store_true", help="Load each task's default model at start-up")
+    parser.add_argument("--max-gpu-models", type=int, help="Override max_gpu_models from the config")
+    parser.add_argument("--log-dir", default=str(ROOT / "logs"), help="Where jobs.csv / feedback.csv are written")
     args = parser.parse_args(argv)
 
-    registry = build_registry(load_config(args.config), with_diffusion=not args.no_diffusion)
+    config = load_config(args.config)
+    if args.max_gpu_models:
+        config["max_gpu_models"] = args.max_gpu_models
+    registry = build_registry(config, with_diffusion=not args.no_diffusion, with_models=not args.baselines_only)
+    print(model_summary(registry))
+    if args.preload:
+        print("Preloading:", ", ".join(registry.preload()) or "nothing (no GPU models)")
     examples = None
     if args.prepared_dir:
         from src.data.benchmark_examples import BenchmarkExamples
 
         examples = BenchmarkExamples(args.prepared_dir, "val", args.inpaint_manifest)
-    app = create_app(registry, examples)
+    app = create_app(registry, examples, log_dir=args.log_dir)
     try:
         from waitress import serve
 

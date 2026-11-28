@@ -39,7 +39,7 @@ def _png(array: np.ndarray, mode: str | None = None) -> bytes:
 
 
 def _client():
-    return create_app(build_registry(with_diffusion=False)).test_client()
+    return create_app(build_registry(with_models=False)).test_client()
 
 
 def _wait(client, job_id, timeout=30):
@@ -166,25 +166,40 @@ def test_first_epoch_unchanged_by_fix(tmp_path):
 
 # --------------------------------------------------------------------------- 4. notebook sync
 WRITEFILE = re.compile(r'^%%writefile\s+"?\{CODE_DIR\}/([^"\s]+)"?\s*$')
+# The Week 1 notebook is a record of the code reviewed in PR #1. Its %%writefile cells must match the
+# repository *at that commit*; later work (the integrated app) changes these files on purpose.
+WEEK1_COMMIT = "695cc9ad0404152c624561d098d2679115c48fb7"
 
 
-def test_notebook_writefile_cells_match_repository():
-    notebooks = sorted((ROOT / "notebooks").glob("PlantSR_Inpainting_Week1*.ipynb"))
-    assert notebooks, "inpainting notebook not found"
+def _git_show(commit: str, path: str) -> str | None:
+    import subprocess
+
+    try:
+        done = subprocess.run(["git", "-C", str(ROOT), "show", f"{commit}:{path}"], capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.decode("utf-8").replace("\r\n", "\n") if done.returncode == 0 else None
+
+
+def test_week1_notebook_writefile_cells_match_week1_commit():
+    import pytest
+
+    notebook = ROOT / "notebooks" / "PlantSR_Inpainting_Week1_Final.ipynb"
+    assert notebook.is_file(), "inpainting notebook not found"
+    if _git_show(WEEK1_COMMIT, "app/app.py") is None:
+        pytest.skip(f"git history with commit {WEEK1_COMMIT[:7]} is not available (e.g. a ZIP download)")
     checked = 0
-    for notebook in notebooks:
-        for cell in json.loads(notebook.read_text(encoding="utf-8"))["cells"]:
-            source = "".join(cell["source"])
-            match = WRITEFILE.match(source.split("\n", 1)[0]) if cell["cell_type"] == "code" else None
-            if not match:
-                continue
-            body = source.split("\n", 1)[1] if "\n" in source else ""
-            repo_file = ROOT / match.group(1)
-            assert repo_file.is_file(), f"{notebook.name}: {match.group(1)} is not in the repository"
-            repo_text = repo_file.read_text(encoding="utf-8").replace("\r\n", "\n")
-            assert body.rstrip("\n") == repo_text.rstrip("\n"), (
-                f"{notebook.name}: the %%writefile cell for {match.group(1)} differs from the repository file")
-            checked += 1
+    for cell in json.loads(notebook.read_text(encoding="utf-8"))["cells"]:
+        source = "".join(cell["source"])
+        match = WRITEFILE.match(source.split("\n", 1)[0]) if cell["cell_type"] == "code" else None
+        if not match:
+            continue
+        body = source.split("\n", 1)[1] if "\n" in source else ""
+        committed = _git_show(WEEK1_COMMIT, match.group(1))
+        assert committed is not None, f"{match.group(1)} is not in commit {WEEK1_COMMIT[:7]}"
+        assert body.rstrip("\n") == committed.rstrip("\n"), (
+            f"the %%writefile cell for {match.group(1)} differs from commit {WEEK1_COMMIT[:7]}")
+        checked += 1
     assert checked >= 15, f"only {checked} %%writefile cells found"
 
 
