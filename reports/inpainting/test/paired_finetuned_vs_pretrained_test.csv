@@ -1,0 +1,8 @@
+metric,better_if,mean_sd15_finetuned,mean_sd15_pretrained,mean_difference,sd15_finetuned_better_share,pairs,wilcoxon_p
+masked_bbox_lpips,lower,0.102619,0.119487,-0.016868,0.835,200,0.0
+masked_psnr,higher,20.588662,19.484325,1.104337,0.82,200,0.0
+masked_ssim,higher,0.537247,0.495824,0.041423,0.845,200,0.0
+masked_l1,lower,0.071201,0.080912,-0.009711,0.83,200,0.0
+boundary_l1,lower,0.021034,0.025006,-0.003972,0.89,200,0.0
+boundary_grad_l1,lower,0.077429,0.092091,-0.014662,0.835,200,0.0
+full_psnr_supplementary,higher,29.810723,28.706386,1.104338,0.82,200,0.0

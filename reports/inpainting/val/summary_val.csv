@@ -1,0 +1,4 @@
+method,masked_bbox_lpips,masked_psnr,masked_ssim,masked_l1,boundary_l1,boundary_grad_l1,full_psnr_supplementary,crops,failures
+opencv_telea,0.171381,20.826621,0.577989,0.067841,0.018307,0.074567,30.041805,166,0
+sd15_finetuned,0.098421,21.003803,0.564022,0.067627,0.019462,0.070374,30.218986,166,0
+sd15_pretrained,0.126167,19.54632,0.509035,0.083076,0.026302,0.097197,28.761504,166,0
