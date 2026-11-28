@@ -376,5 +376,65 @@ def test_pipeline_stops_at_a_failing_step_and_keeps_earlier_results():
     assert client.get(f"/api/jobs/{job['id']}/output.png").status_code == 404
 
 
+# --------------------------------------------------------------------------- inpainting fine-tuning (C2)
+def test_c2_training_helpers(tmp_path):
+    from src.train.inpaint_lora import export_lora, list_checkpoints, warmup_factor
+
+    assert [round(warmup_factor(i, 4), 2) for i in range(6)] == [0.25, 0.5, 0.75, 1.0, 1.0, 1.0]
+    assert warmup_factor(0, 0) == 1.0
+    for step in (500, 250, 1000):
+        folder = tmp_path / f"step_{step:05d}"
+        folder.mkdir()
+        (folder / "pytorch_lora_weights.safetensors").write_bytes(b"x" * step)
+        (folder / "trial_config.json").write_text(json.dumps({"step": step}))
+    (tmp_path / "step_00750").mkdir()  # incomplete checkpoint (no weights) is ignored
+    assert [s for s, _ in list_checkpoints(tmp_path)] == [250, 500, 1000]
+    dest = export_lora(tmp_path / "step_00500", tmp_path / "lora_best", {"selection": {"step": 500}})
+    assert dest.stat().st_size == 500
+    record = json.loads((tmp_path / "lora_best" / "trial_config.json").read_text())
+    assert record == {"step": 500, "selection": {"step": 500}}
+
+
+def test_c2_evaluation_helpers():
+    from src.evaluation.inpaint_eval import paired, stratified_ids, summary
+
+    class Examples:
+        mask_info = {f"s{i}": {"mask_type": "rectangle" if i % 2 else "freeform", "mask_coverage": 0.05 + 0.01 * i}
+                     for i in range(10)}
+
+        def ids(self):
+            return list(self.mask_info)
+
+    picked = stratified_ids(Examples(), 4)
+    assert len(picked) == 4 and len(set(picked)) == 4
+    assert {Examples.mask_info[s]["mask_type"] for s in picked} == {"rectangle", "freeform"}
+
+    import pandas as pd
+
+    table = pd.DataFrame({"method": ["a"] * 6 + ["b"] * 6, "sample_id": [f"s{i}" for i in range(6)] * 2,
+                          "masked_bbox_lpips": [0.1] * 6 + [0.2] * 6, "masked_psnr": [20.0] * 6 + [19.0] * 6})
+    compared = paired(table, "a", "b").set_index("metric")
+    assert compared.loc["masked_bbox_lpips", "a_better_share"] == 1.0  # lower LPIPS is better
+    assert compared.loc["masked_psnr", "a_better_share"] == 1.0        # higher PSNR is better
+    assert summary(table).loc["a", "crops"] == 6
+
+
+def test_finetuned_inpainting_becomes_default_when_installed(tmp_path):
+    cfg = _config(tmp_path)
+    cfg["inpainting"]["model_id"] = "not/downloaded"  # handlers load lazily; nothing is fetched here
+    assert DEFAULT_CONFIG["inpainting"]["default_method"] == "sd15_finetuned"
+    without = {t["task"]: t for t in build_registry(cfg).describe()}["inpainting"]
+    assert without["default_method"] == "sd15_pretrained"
+    assert any(u["method"] == "sd15_finetuned" for u in without["unavailable"])
+    lora = tmp_path / "lora"
+    lora.mkdir()
+    (lora / "pytorch_lora_weights.safetensors").write_bytes(b"0")
+    cfg["inpainting"]["lora_path"] = str(lora)
+    task = {t["task"]: t for t in build_registry(cfg).describe()}["inpainting"]
+    assert task["default_method"] == "sd15_finetuned" and not task["unavailable"]
+    label = next(m["label"] for m in task["methods"] if m["method"] == "sd15_finetuned")
+    assert label == "SD 1.5 inpainting · fine-tuned on PlantSR"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

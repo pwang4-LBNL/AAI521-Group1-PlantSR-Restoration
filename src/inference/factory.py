@@ -54,7 +54,7 @@ DEFAULT_CONFIG = {
         "guidance": 5.0,
         "lora_path": "checkpoints/inpaint/lora",
         "lora_label": "",
-        "default_method": "sd15_pretrained",
+        "default_method": "sd15_finetuned",
     },
 }
 

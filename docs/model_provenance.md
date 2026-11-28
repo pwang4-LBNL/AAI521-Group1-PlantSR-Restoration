@@ -11,8 +11,8 @@ Git; `scripts/install_checkpoints.py` installs and verifies them (`docs/deployme
 | Colorization | `ddcolor_pretrained` | same, without fine-tuning | — | Hugging Face cache | — |
 | Super-resolution | `hat_l` (default), `real_esrgan` | HAT-L `jaideepsingh/upscale_models` · `HAT/HAT-L_SRx4_ImageNet-pretrain.pth`; Real-ESRGAN `kornia/real_esrgan` · `RealESRGAN_x4plus.safetensors` (revisions pinned in `plantsr_sr/models.py`) | `notebooks/PlantSR_x4_Super_Resolution_Colab_combined_final.ipynb` | `plantsr_sr/weights/{hat_l,real_esrgan}.pt` · SHA-256 in `plantsr_sr/manifest.json` | Peng |
 | Super-resolution | `hat_l_pretrained` | HAT-L as above (downloaded and SHA-checked by `plantsr_sr`) | — | Hugging Face cache | — |
-| Inpainting | `sd15_pretrained` (default) | `stable-diffusion-v1-5/stable-diffusion-inpainting` (CreativeML OpenRAIL-M) | zero-shot; setting chosen on validation in `notebooks/PlantSR_Inpainting_Week1_Final.ipynb` | Hugging Face cache | Ali |
-| Inpainting | `sd15_finetuned` | same + PlantSR LoRA | full LoRA fine-tune (C2), **not trained yet** | `checkpoints/inpaint/lora/` | Ali |
+| Inpainting | `sd15_pretrained` | `stable-diffusion-v1-5/stable-diffusion-inpainting` (CreativeML OpenRAIL-M) | zero-shot; setting chosen on validation in `notebooks/PlantSR_Inpainting_Week1_Final.ipynb` | Hugging Face cache | Ali |
+| Inpainting | `sd15_finetuned` (default when installed) | same + PlantSR LoRA (rank 16, UNet attention) | `notebooks/PlantSR_Inpainting_C2_Finetune.ipynb`, checkpoint chosen by validation missing-region LPIPS | `checkpoints/inpaint/lora/` (from Drive `inpainting_c2/lora_best/`) | Ali |
 | all | `opencv_nlmeans`, `bicubic_x4`, `grayscale_rgb`, `opencv_telea`, `opencv_ns` | classical baselines, no weights | — | — | — |
 
 Super-resolution bundle: Peng's `PlantSR_x4_app.zip`, linked from `docs/super_resolution.md` (Google Drive
