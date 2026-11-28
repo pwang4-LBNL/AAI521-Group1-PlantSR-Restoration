@@ -42,8 +42,14 @@ def to_gray_u8(rgb_u8: np.ndarray, device=None) -> np.ndarray:
     return np.repeat(gray.mean(axis=2, keepdims=True).round().astype(np.uint8), 3, axis=2)
 
 
-def is_neutral_gray(rgb_u8: np.ndarray) -> bool:
-    return bool(np.array_equal(rgb_u8[..., 0], rgb_u8[..., 1]) and np.array_equal(rgb_u8[..., 1], rgb_u8[..., 2]))
+GRAY_TOLERANCE = 4  # grayscale JPGs and rounding leave channels a few levels apart
+
+
+def is_neutral_gray(rgb_u8: np.ndarray, tolerance: int = GRAY_TOLERANCE) -> bool:
+    """True for grayscale photos stored as RGB, allowing small channel differences from JPEG/rounding."""
+    rgb = np.asarray(rgb_u8, dtype=np.int16)
+    spread = rgb.max(axis=-1) - rgb.min(axis=-1)
+    return bool(spread.max() <= tolerance)
 
 
 class DDColorColorize(TaskHandler):

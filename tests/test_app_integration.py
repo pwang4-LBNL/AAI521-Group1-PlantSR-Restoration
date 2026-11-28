@@ -139,6 +139,8 @@ def test_ddcolor_keeps_the_input_lightness():
     assert result.success, result.error
     assert result.output_size == (80, 64) and result.processed_size == (512, 512)
     assert not result.extra.get("notes"), "an already-gray input must not be converted again"
+    near_gray = np.clip(gray.astype(int) + RNG.integers(-2, 3, gray.shape), 0, 255).astype(np.uint8)  # e.g. a gray JPG
+    assert is_neutral_gray(near_gray) and not is_neutral_gray(_photo(64, 80))
     regray = to_gray_u8(np.asarray(result.image), "cpu")
     assert np.abs(regray.astype(int) - gray.astype(int)).mean() < 2.0, "colorization must keep L*"
 
